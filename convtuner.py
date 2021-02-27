@@ -1,21 +1,24 @@
+#!/usr/bin/env python
+import re
 import subprocess
 import timeit
 from ast import literal_eval
 from functools import partial, reduce
+from itertools import chain
 from operator import mul
+from typing import List
 
 import pandas as pd
 import sympy
 import torch
 import torch.utils.cpp_extension
-from typing import List
-import re
 
 torch.set_num_threads(1)
 
 product = partial(reduce, mul)
 S = partial(sympy.simplify, evaluate=True)
 PRINT = False
+VECTOR_SIZE = 8
 
 
 def naive_conv(conv):
@@ -70,8 +73,52 @@ def naive_conv(conv):
     return _conv
 
 
+def identity(x):
+    return x
+
+
 class Node(object):
-    pass
+    def visit(self, node_fn, expr_fn=identity):
+        def wrap1(n):
+            node_fn(n)
+            return n
+
+        def wrap2(n):
+            expr_fn(n)
+            return n
+
+        self.apply(wrap1, wrap2)
+
+    def apply_node(self, node_fn):
+        return self.apply(node_fn, identity)
+
+    def apply_expr(self, expr_fn):
+        return self.apply(identity, expr_fn)
+
+    def replace(self, replacements):
+        return self.apply_expr(lambda x: x.subs(replacements))
+
+    def replace_nodes(self, replacements):
+        def visit(n):
+            try:
+                return replacements[n]
+            except KeyError:
+                return n
+
+        return self.apply_node(visit)
+
+    def apply(self, node_fn, expr_fn):
+        raise NotImplementedError()
+
+    def find_all(self, cls):
+        result = []
+
+        def visitor(n):
+            if isinstance(n, cls):
+                result.append(n)
+
+        self.visit(visitor)
+        return result
 
 
 class LoopRange(Node):
@@ -84,11 +131,11 @@ class LoopRange(Node):
         self.end = S(end)
         self.step = S(step)
 
-    def subs(self, replacements):
-        self.begin = self.begin.subs(replacements)
-        self.end = self.end.subs(replacements)
-        self.step = self.step.subs(replacements)
-        return self
+    def apply(self, node_fn, expr_fn):
+        return node_fn(LoopRange(name=self.name,
+                                 begin=expr_fn(self.begin),
+                                 end=expr_fn(self.end),
+                                 step=expr_fn(self.step)))
 
     def __str__(self):
         return f"for(int {self.name} = {self.begin}; {self.name} < {self.end}; {self.name} += {self.step})"
@@ -100,18 +147,19 @@ class Loops(Node):
         self.ranges: List[LoopRange] = list(ranges)
         self.body: Node = body
 
-    def subs(self, replacements):
-        self.body = self.body.subs(replacements)
+    def apply(self, node_fn, expr_fn):
+        body = self.body.apply(node_fn, expr_fn)
+        if body is None:
+            return None
         new_ranges = []
         for r in self.ranges:
-            r = r.subs(replacements)
+            r = r.apply(node_fn, expr_fn)
             if (isinstance(S(r.begin + r.step < r.end), sympy.logic.boolalg.BooleanFalse) and
                     isinstance(S(r.begin < r.end), sympy.logic.boolalg.BooleanTrue)):
-                self.body = self.body.subs({r.name: r.begin})
+                body = body.replace({r.name: r.begin})
             else:
                 new_ranges.append(r)
-        self.ranges = new_ranges
-        return self
+        return node_fn(Loops(new_ranges, body))
 
     def __str__(self):
         return "\n".join(map(str, self.ranges + [self.body]))
@@ -123,11 +171,15 @@ class Condition(Node):
         self.tests: List[sympy.Expr] = list(map(S, tests))
         self.body: Node = body
 
-    def subs(self, replacements):
-        self.tests = [x.subs(replacements) for x in self.tests]
-        self.tests = [x for x in self.tests if not isinstance(x, sympy.logic.boolalg.BooleanTrue)]
-        self.body = self.body.subs(replacements)
-        return self
+    def apply(self, node_fn, expr_fn):
+        tests = [expr_fn(x) for x in self.tests]
+        tests = [x for x in tests if not isinstance(x, sympy.logic.boolalg.BooleanTrue)]
+        body = self.body.apply(node_fn, expr_fn)
+        if not tests:
+            return body
+        if any(isinstance(x, sympy.logic.boolalg.BooleanFalse) for x in tests):
+            return None
+        return node_fn(Condition(tests, body))
 
     def __str__(self):
         test = " && ".join(map(str, self.tests))
@@ -141,11 +193,11 @@ class Sum(Node):  # could generalize to Reduction()
         self.inputs: List[Memory] = list(inputs)
         self.expression: sympy.Expr = S(expression)
 
-    def subs(self, replacements):
-        self.output = self.output.subs(replacements)
-        self.inputs = [x.subs(replacements) for x in self.inputs]
-        self.expression = self.expression.subs(replacements)
-        return self
+    def apply(self, node_fn, expr_fn):
+        output = self.output.apply(node_fn, expr_fn)
+        inputs = [x.apply(node_fn, expr_fn) for x in self.inputs]
+        expression = expr_fn(self.expression)
+        return node_fn(Sum(output, inputs, expression))
 
     def __str__(self):
         expr = str(self.expression)
@@ -154,20 +206,79 @@ class Sum(Node):  # could generalize to Reduction()
         return f"{self.output} += {expr};"
 
 
+class Block(Node):
+    def __init__(self, statements):
+        super(Block, self).__init__()
+        self.statements = statements
+
+    def apply(self, node_fn, expr_fn):
+        stmts = []
+        for s in self.statements:
+            s = s.apply(node_fn, expr_fn)
+            if isinstance(s, Block):
+                stmts.extend(s.statements)
+            elif s is not None:
+                stmts.append(s)
+        if len(stmts) == 0:
+            return None
+        if len(stmts) == 1:
+            return stmts[0]
+        return node_fn(Block(stmts))
+
+    def __str__(self):
+        return "{\n" + "\n".join(map(str, self.statements)) + "}\n"
+
+
 class Memory(Node):
-    def __init__(self, name, indices):
+    @classmethod
+    def from_indices(cls, name, indices):
+        assert isinstance(indices, list)
+        return cls(name, sum(sympy.Mul(S(v), S(f"{name}_stride{i}"))
+                             for i, v in enumerate(indices)))
+
+    def __init__(self, name, index):
         super(Memory, self).__init__()
         self.name = name
-        assert isinstance(indices, list)
-        self.index = S(sum(sympy.Mul(S(v), S(f"{name}_stride{i}"))
-                           for i, v in enumerate(indices)))
+        self.index = S(index)
 
     def __str__(self):
         return f"{self.name}[{self.index}]"
 
-    def subs(self, replacements):
-        self.index = S(self.index.subs(replacements))
-        return self
+    def apply(self, node_fn, expr_fn):
+        return node_fn(self.__class__(self.name, expr_fn(self.index)))
+
+
+class TempRef(Node):
+    def __init__(self, name):
+        super(TempRef, self).__init__()
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+    def apply(self, node_fn, expr_fn):
+        return node_fn(self.__class__(self.name))
+
+
+class TempDef(Node):
+    def __init__(self, dtype, name):
+        super(TempDef, self).__init__()
+        self.dtype = dtype
+        self.name = name
+
+    def __str__(self):
+        return f"{self.dtype} {self.name} = 0;"
+
+    def apply(self, node_fn, expr_fn):
+        return node_fn(self.__class__(self.name))
+
+
+class Load(Memory):
+    pass
+
+
+class Store(Memory):
+    pass
 
 
 class ConvolutionGenerator(object):
@@ -212,11 +323,12 @@ class ConvolutionGenerator(object):
         self.name = f"conv{self.counter}"
         ConvolutionGenerator.counter += 1
         self.constants = self.get_constants(conv, image)
-        self.dtype = image.dtype
+        self.dtype = "float"
         self.weight = conv.weight
         self.bias = conv.bias
         if self.bias is not None:
             self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
+        self._tmpvar = 0
 
         macros = {"in_channel": S("in_channel_g + g * (in_channels // groups)"),
                   "out_channel": S("out_channel_g + g * (out_channels // groups)"),
@@ -239,10 +351,12 @@ class ConvolutionGenerator(object):
                  "in0 < in_sizes0",
                  "in1 < in_sizes1"],
                 Sum(
-                    Memory("out", ["n", "out_channel", "out0", "out1"]),
-                    [Memory("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
-                     Memory("image", ["n", "in_channel", "in0", "in1"])],
-                    "v0 * v1"))).subs(macros).subs(self.constants)
+                    Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
+                    [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
+                     Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
+                    "v0 * v1"))).replace(macros).replace(self.constants)
+
+        self.body = self.body.apply_node(self.cache_writes)
 
         PRINT and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
         torch.utils.cpp_extension.load_inline(
@@ -254,12 +368,47 @@ class ConvolutionGenerator(object):
         )
         self.compiled = getattr(getattr(torch.ops, self.name), self.name)
 
+    def tmpvar(self):
+        n = f"tmp{self._tmpvar}"
+        self._tmpvar += 1
+        return n
+
+    def cache_writes(self, loops: Node):
+        if isinstance(loops, Loops):
+            stores = set(chain(*[s.find_all(Store) for s in loops.find_all(Sum)]))
+            body = loops.body
+            ranges = []
+            for rng in reversed(loops.ranges):
+                stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
+                defs = []
+                sums = []
+                for store in stores - stores_idep:
+                    var = self.tmpvar()
+                    defs.append(TempDef(self.dtype, var))
+                    sums.append(Sum(store, [TempRef(var)], "v0"))
+
+                    def swap(n):
+                        if isinstance(n, Store) and str(store) == str(n):
+                            return TempRef(var)
+                        return n
+
+                    body = body.apply_node(swap)
+                if ranges and len(stores_idep) < len(stores):
+                    body = Block(defs + [Loops(ranges, body)] + sums)
+                    ranges = [rng]
+                else:
+                    ranges.insert(0, rng)
+                stores = stores_idep
+            return Loops(ranges, body)
+        return loops
+
     def __str__(self):
         return f"""
             # include <torch/script.h>
             void {self.name}(const torch::Tensor& _weight,
                         const torch::Tensor& _image,
                         const torch::Tensor& _out) {{
+                typedef float vec __attribute__ ((vector_size ({VECTOR_SIZE})));
                 float* __restrict__ weight = _weight.data_ptr<float>();
                 float* __restrict__ image = _image.data_ptr<float>();
                 float* __restrict__ out = _out.data_ptr<float>();
@@ -308,17 +457,18 @@ def gflops(conv, image):
 
 
 def test_conv(conv: torch.nn.Conv2d, image: torch.Tensor):
-    correct = conv(image)
-    # result = naive_conv1(conv)(image)
     cg = ConvolutionGenerator(conv, image)
     result = cg(image)
+
+    correct = conv(image)
+    # result = naive_conv1(conv)(image)
+
     torch.testing.assert_allclose(correct, result)
 
+    gf = gflops(conv, image)
     sec1 = timeit.timeit(lambda: conv(image), number=3)
     sec2 = timeit.timeit(lambda: cg(image), number=3)
-    print(f"baseline {sec1 / gflops(conv, image):.1f}")
-    print(f"generated {sec2 / gflops(conv, image):.1f}")
-    print(f"speedup {sec1 / sec2:.2f}")
+    print(f"{gf / sec1:.1f} gflops => {gf / sec2:.1f} gflops {sec1 / sec2:.2f}x")
 
 
 class Once(set):
@@ -337,8 +487,14 @@ def unittests():
 
 
 def main():
-    # unittests()
-    # return
+    if False:
+        unittests()
+        return
+
+    if False:
+        test_conv(torch.nn.Conv2d(576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
+                  torch.randn(1, 576, 1, 1))
+        return
 
     first = Once()
     testcases = pd.read_csv("testcases.csv").sort_values("gflops")
@@ -346,10 +502,10 @@ def main():
         conv_args = literal_eval(row["conv2d"])
         input_shape = literal_eval(row["input"])
         if first(conv_args, input_shape):
-            print(conv_args, input_shape, )
+            print(f"{conv_args}/{input_shape}")
             test_conv(torch.nn.Conv2d(*conv_args),
                       torch.randn(input_shape))
-        if len(first) > 10:
+        if len(first) > 50:
             return
 
 
