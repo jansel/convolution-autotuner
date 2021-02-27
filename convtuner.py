@@ -17,60 +17,18 @@ torch.set_num_threads(1)
 
 product = partial(reduce, mul)
 S = partial(sympy.simplify, evaluate=True)
-PRINT = False
+PRINT = True
 VECTOR_SIZE = 8
+VECTOR_BITS = VECTOR_SIZE * 32
+TIMES = 3
 
 
-def naive_conv(conv):
-    in_channels = conv.in_channels
-    out_channels = conv.out_channels
-    groups = conv.groups
-    padding = conv.padding
-    dilation = conv.dilation
-    kernel_size = conv.kernel_size
-    stride = conv.stride
-    weight = conv.weight
-    bias = conv.bias
-    stride0, stride1 = stride
-    dilation0, dilation1 = dilation
-    padding0, padding1 = padding
-    kernel_size0, kernel_size1 = kernel_size
-    if bias is not None:
-        bias = bias.view(1, bias.shape[0], 1, 1)
-    assert conv.padding_mode == "zeros"
+def is_true(x):
+    return isinstance(S(x), sympy.logic.boolalg.BooleanTrue)
 
-    def _conv(image):
-        batch_size, _, *in_sizes = image.shape
-        out_sizes = [
-            (v + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1) // stride[i] + 1
-            for i, v in enumerate(in_sizes)]
-        out = torch.zeros([batch_size, out_channels] + out_sizes)
-        in_sizes0, in_sizes1 = in_sizes
-        out_sizes0, out_sizes1 = out_sizes
 
-        for n in range(batch_size):
-            for group in range(groups):
-                for out_channel_g in range(out_channels // groups):
-                    for in_channel_g in range(in_channels // groups):
-                        for out0 in range(out_sizes0):
-                            for out1 in range(out_sizes1):
-                                for kernel0 in range(kernel_size0):
-                                    for kernel1 in range(kernel_size1):
-                                        in_chan = in_channel_g + group * (in_channels // groups)
-                                        out_chan = out_channel_g + group * (out_channels // groups)
-                                        in0 = out0 * stride0 + kernel0 * dilation0 - padding0
-                                        in1 = out1 * stride1 + kernel1 * dilation1 - padding1
-                                        if 0 <= in0 < in_sizes0 and 0 <= in1 < in_sizes1:
-                                            out[n, out_chan, out0, out1] += (
-                                                    weight[out_chan, in_channel_g, kernel0, kernel1] *
-                                                    image[n, in_chan, in0, in1]
-                                            )
-
-        if bias is not None:
-            out += bias
-        return out
-
-    return _conv
+def is_false(x):
+    return isinstance(S(x), sympy.logic.boolalg.BooleanFalse)
 
 
 def identity(x):
@@ -95,7 +53,7 @@ class Node(object):
     def apply_expr(self, expr_fn):
         return self.apply(identity, expr_fn)
 
-    def replace(self, replacements):
+    def subs(self, replacements):
         return self.apply_expr(lambda x: x.subs(replacements))
 
     def replace_nodes(self, replacements):
@@ -137,6 +95,10 @@ class LoopRange(Node):
                                  end=expr_fn(self.end),
                                  step=expr_fn(self.step)))
 
+    def can_vectorize(self):
+        return (is_true(self.begin + VECTOR_SIZE <= self.end) and
+                S(((self.end - self.begin) // self.step) % VECTOR_SIZE) == 0)
+
     def __str__(self):
         return f"for(int {self.name} = {self.begin}; {self.name} < {self.end}; {self.name} += {self.step})"
 
@@ -154,9 +116,9 @@ class Loops(Node):
         new_ranges = []
         for r in self.ranges:
             r = r.apply(node_fn, expr_fn)
-            if (isinstance(S(r.begin + r.step < r.end), sympy.logic.boolalg.BooleanFalse) and
-                    isinstance(S(r.begin < r.end), sympy.logic.boolalg.BooleanTrue)):
-                body = body.replace({r.name: r.begin})
+            if (is_false(S(r.begin + r.step < r.end)) and
+                    is_true(S(r.begin < r.end))):
+                body = body.subs({r.name: r.begin})
             else:
                 new_ranges.append(r)
         return node_fn(Loops(new_ranges, body))
@@ -173,11 +135,11 @@ class Condition(Node):
 
     def apply(self, node_fn, expr_fn):
         tests = [expr_fn(x) for x in self.tests]
-        tests = [x for x in tests if not isinstance(x, sympy.logic.boolalg.BooleanTrue)]
+        tests = [x for x in tests if not is_true(x)]
         body = self.body.apply(node_fn, expr_fn)
         if not tests:
             return body
-        if any(isinstance(x, sympy.logic.boolalg.BooleanFalse) for x in tests):
+        if any(map(is_false, tests)):
             return None
         return node_fn(Condition(tests, body))
 
@@ -186,9 +148,9 @@ class Condition(Node):
         return f"if({test})\n{self.body}"
 
 
-class Sum(Node):  # could generalize to Reduction()
+class Reduction(Node):
     def __init__(self, output, inputs, expression):
-        super(Sum, self).__init__()
+        super(Reduction, self).__init__()
         self.output: Memory = output
         self.inputs: List[Memory] = list(inputs)
         self.expression: sympy.Expr = S(expression)
@@ -197,12 +159,16 @@ class Sum(Node):  # could generalize to Reduction()
         output = self.output.apply(node_fn, expr_fn)
         inputs = [x.apply(node_fn, expr_fn) for x in self.inputs]
         expression = expr_fn(self.expression)
-        return node_fn(Sum(output, inputs, expression))
+        return node_fn(self.__class__(output, inputs, expression))
 
+
+class Sum(Reduction):
     def __str__(self):
         expr = str(self.expression)
         for i, v in enumerate(self.inputs):
             expr = re.sub(fr"\bv{i}\b", str(v), expr)
+        if isinstance(self.output, ReduceStore):
+            return f"{self.output} += _mm{VECTOR_BITS}_reduce_add_ps({expr});"
         return f"{self.output} += {expr};"
 
 
@@ -248,6 +214,44 @@ class Memory(Node):
         return node_fn(self.__class__(self.name, expr_fn(self.index)))
 
 
+class Load(Memory):
+    def broadcast(self):
+        return BroadcastLoad(self.name, self.index)
+
+    def vectorize(self):
+        return VectorLoad(self.name, self.index)
+
+
+class Store(Memory):
+    def broadcast(self):
+        return ReduceStore(self.name, self.index)
+
+    def vectorize(self):
+        return VectorStore(self.name, self.index)
+
+
+class VectorizedMemory(Memory):
+    def __str__(self):
+        return f"(*(__m{VECTOR_BITS}* __restrict__)({self.name} + {self.index}))"
+
+
+class VectorLoad(VectorizedMemory):
+    pass
+
+
+class VectorStore(VectorizedMemory):
+    pass
+
+
+class ReduceStore(Memory):
+    pass
+
+
+class BroadcastLoad(Memory):
+    def __str__(self):
+        return f"_mm{VECTOR_BITS}_broadcast_ss({self.name} + {self.index})"
+
+
 class TempRef(Node):
     def __init__(self, name):
         super(TempRef, self).__init__()
@@ -261,24 +265,23 @@ class TempRef(Node):
 
 
 class TempDef(Node):
-    def __init__(self, dtype, name):
+    def __init__(self, name, dtype="float", init="0"):
         super(TempDef, self).__init__()
         self.dtype = dtype
         self.name = name
+        self.init = init
 
     def __str__(self):
-        return f"{self.dtype} {self.name} = 0;"
+        return f"{self.dtype} {self.name} = {self.init};"
 
     def apply(self, node_fn, expr_fn):
-        return node_fn(self.__class__(self.name))
+        return node_fn(self.__class__(self.name, self.dtype, self.init))
 
-
-class Load(Memory):
-    pass
-
-
-class Store(Memory):
-    pass
+    def vectorize(self):
+        assert self.dtype == "float" and self.init == "0"
+        return self.__class__(self.name,
+                              f"__m{VECTOR_BITS}",
+                              f"_mm{VECTOR_BITS}_setzero_ps()")
 
 
 class ConvolutionGenerator(object):
@@ -354,11 +357,14 @@ class ConvolutionGenerator(object):
                     Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
                     [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
                      Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
-                    "v0 * v1"))).replace(macros).replace(self.constants)
+                    "v0 * v1"))).subs(macros).subs(self.constants)
 
-        self.body = self.body.apply_node(self.cache_writes)
+        self.print()
+        self.run_pass(self.vectorize_pass)
+        self.print()
+        self.run_pass(self.cache_writes_pass)
+        self.print()
 
-        PRINT and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
         torch.utils.cpp_extension.load_inline(
             name=self.name,
             cpp_sources=str(self),
@@ -368,51 +374,113 @@ class ConvolutionGenerator(object):
         )
         self.compiled = getattr(getattr(torch.ops, self.name), self.name)
 
+    def print(self):
+        PRINT and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
+
     def tmpvar(self):
         n = f"tmp{self._tmpvar}"
         self._tmpvar += 1
         return n
 
-    def cache_writes(self, loops: Node):
-        if isinstance(loops, Loops):
-            stores = set(chain(*[s.find_all(Store) for s in loops.find_all(Sum)]))
-            body = loops.body
-            ranges = []
-            for rng in reversed(loops.ranges):
-                stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
-                defs = []
-                sums = []
-                for store in stores - stores_idep:
-                    var = self.tmpvar()
-                    defs.append(TempDef(self.dtype, var))
-                    sums.append(Sum(store, [TempRef(var)], "v0"))
+    def run_pass(self, pass_fn, target_cls=Loops):
+        def wrapper(node):
+            if isinstance(node, target_cls):
+                return pass_fn(node)
+            return node
 
-                    def swap(n):
-                        if isinstance(n, Store) and str(store) == str(n):
-                            return TempRef(var)
-                        return n
+        self.body = self.body.apply_node(wrapper)
 
-                    body = body.apply_node(swap)
-                if ranges and len(stores_idep) < len(stores):
-                    body = Block(defs + [Loops(ranges, body)] + sums)
-                    ranges = [rng]
+    def vectorize_pass(self, loops: Loops, direction=reversed):
+        memory = loops.find_all(Memory)
+        conds = reduce(set.union,
+                       [set(map(str, t.free_symbols)) for t in chain(*[c.tests for c in loops.find_all(Condition)])],
+                       set())
+        ranges = []
+        body = loops.body
+        first = True
+        for rng in direction(loops.ranges):
+            diffs = [sympy.diff(s.index, rng.name) for s in memory]
+            if (first and
+                    rng.name not in conds and
+                    all((x == 0 or x == 1) for x in diffs) and
+                    any(x == 1 for x in diffs) and
+                    rng.can_vectorize()):
+                def swap(n):
+                    if isinstance(n, Memory):
+                        delta = sympy.diff(n.index, rng.name)
+                        if delta == 1:
+                            return n.vectorize()
+                        assert delta == 0
+                        return n.broadcast()
+                    return n
+
+                body = body.apply_node(swap)
+                ranges.append(LoopRange(
+                    rng.name,
+                    rng.begin,
+                    rng.end,
+                    rng.step * VECTOR_SIZE
+                ))
+                first = False
+            else:
+                ranges.append(rng)
+        return Loops(direction(ranges), body)
+
+    def cache_writes_pass(self, loops: Loops):
+        stores = set(chain(*[s.find_all((Store, ReduceStore)) for s in loops.find_all(Sum)]))
+        ranges = []
+        body = loops.body
+        for rng in reversed(loops.ranges):
+            stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
+            defs = []
+            sums = []
+            for store in stores - stores_idep:
+                var = self.tmpvar()
+                if isinstance(store, ReduceStore):
+                    defs.append(TempDef(var).vectorize())
                 else:
-                    ranges.insert(0, rng)
-                stores = stores_idep
-            return Loops(ranges, body)
-        return loops
+                    defs.append(TempDef(var))
+                sums.append(Sum(store, [TempRef(var)], "v0"))
+
+                def swap(n):
+                    if isinstance(n, (Store, ReduceStore)) and str(store) == str(n):
+                        return TempRef(var)
+                    return n
+
+                body = body.apply_node(swap)
+            if defs or sums:
+                body = Block(defs + [Loops(ranges, body)] + sums)
+                ranges = [rng]
+            else:
+                ranges.insert(0, rng)
+            stores = stores_idep
+        return Loops(ranges, body)
 
     def __str__(self):
         return f"""
-            # include <torch/script.h>
-            void {self.name}(const torch::Tensor& _weight,
-                        const torch::Tensor& _image,
-                        const torch::Tensor& _out) {{
-                typedef float vec __attribute__ ((vector_size ({VECTOR_SIZE})));
-                float* __restrict__ weight = _weight.data_ptr<float>();
+            #include <torch/script.h>
+            #include <immintrin.h>
+            static inline float _mm256_reduce_add_ps(__m256 x) {{
+                const __m128 x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
+                const __m128 x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
+                const __m128 x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
+                return _mm_cvtss_f32(x32);
+            }}
+            torch::Tensor {self.name}(
+                    const torch::Tensor& _image,
+                    const torch::Tensor& _weight)
+            {{
+                torch::Tensor _out = torch::zeros({{
+                    {self.constants["batch_size"]},
+                    {self.constants["out_channels"]},
+                    {self.constants["out_sizes0"]},
+                    {self.constants["out_sizes1"]}
+                }}); 
                 float* __restrict__ image = _image.data_ptr<float>();
+                float* __restrict__ weight = _weight.data_ptr<float>();
                 float* __restrict__ out = _out.data_ptr<float>();
                 {self.body}
+                return _out;
             }}
             TORCH_LIBRARY({self.name}, m)
             {{
@@ -421,11 +489,7 @@ class ConvolutionGenerator(object):
             """
 
     def __call__(self, image):
-        out = torch.zeros([self.constants["batch_size"],
-                           self.constants["out_channels"],
-                           self.constants["out_sizes0"],
-                           self.constants["out_sizes1"]], dtype=image.dtype)
-        self.compiled(self.weight, image, out)
+        out = self.compiled(image, self.weight)
         if self.bias is not None:
             out += self.bias
         return out
@@ -459,16 +523,13 @@ def gflops(conv, image):
 def test_conv(conv: torch.nn.Conv2d, image: torch.Tensor):
     cg = ConvolutionGenerator(conv, image)
     result = cg(image)
-
     correct = conv(image)
-    # result = naive_conv1(conv)(image)
-
     torch.testing.assert_allclose(correct, result)
 
-    gf = gflops(conv, image)
-    sec1 = timeit.timeit(lambda: conv(image), number=3)
-    sec2 = timeit.timeit(lambda: cg(image), number=3)
-    print(f"{gf / sec1:.1f} gflops => {gf / sec2:.1f} gflops {sec1 / sec2:.2f}x")
+    sec1 = timeit.timeit(lambda: conv(image), number=TIMES)
+    sec2 = timeit.timeit(lambda: cg(image), number=TIMES)
+    gf = gflops(conv, image) * TIMES
+    print(f"{gf / sec1:.1f} gflops => {gf / sec2:.1f} gflops - {sec1 / sec2:.2f}x")
 
 
 class Once(set):
@@ -487,13 +548,34 @@ def unittests():
 
 
 def main():
+    global PRINT
+    PRINT = False
+
     if False:
         unittests()
         return
 
     if False:
+        # ReduceStore
         test_conv(torch.nn.Conv2d(576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
                   torch.randn(1, 576, 1, 1))
+        return
+
+    if False:
+        test_conv(torch.nn.Conv2d(16, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
+                  torch.rand(32, 16, 55, 55))
+        return
+
+    if False:
+        test_conv(torch.nn.Conv2d(512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
+                  torch.randn(32, 512, 28, 28))
+
+    if False:
+        # BroadcastLoad / padding
+        test_conv(
+            torch.nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
+            torch.randn(32, 128, 56, 56)
+        )
         return
 
     first = Once()
