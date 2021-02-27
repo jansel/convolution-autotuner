@@ -17,7 +17,7 @@ torch.set_num_threads(1)
 
 product = partial(reduce, mul)
 S = partial(sympy.simplify, evaluate=True)
-PRINT = True
+VERBOSE = True
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
 TIMES = 3
@@ -359,9 +359,8 @@ class ConvolutionGenerator(object):
                      Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
                     "v0 * v1"))).subs(macros).subs(self.constants)
 
-        self.print()
+        self.run_pass(self.simplify_conditionals_pass)
         self.run_pass(self.vectorize_pass)
-        self.print()
         self.run_pass(self.cache_writes_pass)
         self.print()
 
@@ -375,7 +374,7 @@ class ConvolutionGenerator(object):
         self.compiled = getattr(getattr(torch.ops, self.name), self.name)
 
     def print(self):
-        PRINT and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
+        VERBOSE and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
 
     def tmpvar(self):
         n = f"tmp{self._tmpvar}"
@@ -388,6 +387,8 @@ class ConvolutionGenerator(object):
                 return pass_fn(node)
             return node
 
+        self.print()
+        VERBOSE and print(pass_fn.__qualname__)
         self.body = self.body.apply_node(wrapper)
 
     def vectorize_pass(self, loops: Loops, direction=reversed):
@@ -434,20 +435,21 @@ class ConvolutionGenerator(object):
             stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
             defs = []
             sums = []
-            for store in stores - stores_idep:
-                var = self.tmpvar()
-                if isinstance(store, ReduceStore):
-                    defs.append(TempDef(var).vectorize())
-                else:
-                    defs.append(TempDef(var))
-                sums.append(Sum(store, [TempRef(var)], "v0"))
+            if ranges:
+                for store in stores - stores_idep:
+                    var = self.tmpvar()
+                    if isinstance(store, ReduceStore):
+                        defs.append(TempDef(var).vectorize())
+                    else:
+                        defs.append(TempDef(var))
+                    sums.append(Sum(store, [TempRef(var)], "v0"))
 
-                def swap(n):
-                    if isinstance(n, (Store, ReduceStore)) and str(store) == str(n):
-                        return TempRef(var)
-                    return n
+                    def swap(n):
+                        if isinstance(n, (Store, ReduceStore)) and str(store) == str(n):
+                            return TempRef(var)
+                        return n
 
-                body = body.apply_node(swap)
+                    body = body.apply_node(swap)
             if defs or sums:
                 body = Block(defs + [Loops(ranges, body)] + sums)
                 ranges = [rng]
@@ -455,6 +457,31 @@ class ConvolutionGenerator(object):
                 ranges.insert(0, rng)
             stores = stores_idep
         return Loops(ranges, body)
+
+    def simplify_conditionals_pass(self, loops: Loops):
+        first_value = {}
+        last_value = {}
+        for rng in loops.ranges:
+            first_value[rng.name] = S(rng.begin.subs(first_value))
+            last_value[rng.name] = S((rng.end - 1).subs(last_value))
+
+        def visit(node):
+            if isinstance(node, Condition):
+                tests = []
+                for t in node.tests:
+                    # this pass assumes conditionals are monotonic
+                    first = S(t.subs(first_value))
+                    last = S(t.subs(last_value))
+                    if is_true(first) and is_true(last):
+                        tests.append(S(True))
+                    elif is_false(first) and is_false(last):
+                        tests.append(S(False))
+                    else:
+                        tests.append(t)
+                return Condition(tests, node.body).apply_expr(identity)
+            return node
+
+        return loops.apply_node(visit)
 
     def __str__(self):
         return f"""
@@ -548,8 +575,8 @@ def unittests():
 
 
 def main():
-    global PRINT
-    PRINT = False
+    global VERBOSE
+    VERBOSE = True
 
     if False:
         unittests()
@@ -577,6 +604,8 @@ def main():
             torch.randn(32, 128, 56, 56)
         )
         return
+
+    VERBOSE = False
 
     first = Once()
     testcases = pd.read_csv("testcases.csv").sort_values("gflops")
