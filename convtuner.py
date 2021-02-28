@@ -5,13 +5,15 @@ import re
 import subprocess
 import timeit
 from ast import literal_eval
-from collections import Counter
+from collections import Counter, defaultdict
 from functools import partial, reduce, cmp_to_key, lru_cache
 from itertools import chain
 from operator import mul
 from typing import List
 
 import pandas as pd
+import csv
+import io
 import sympy
 import torch
 import torch.utils.cpp_extension
@@ -29,6 +31,7 @@ VECTOR_BITS = VECTOR_SIZE * 32
 TIMES = 3
 PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
 stats = Counter()
+results_csv = csv.writer(io.StringIO())
 
 
 @cmp_to_key
@@ -263,6 +266,80 @@ class Loops(Node):
         if not first:
             memory = [False]  # stop
         return Loops(reversed(ranges), body), memory, banned
+
+    def tiling_and_reorder(self):
+        ranges = {}
+        options0 = []
+        options1 = []
+        body = self.body
+        for r in self.ranges:
+            width = S(r.end - r.begin)
+            assert r.begin == 0  # TODO(jansel): support this
+            assert r.step == 1  # TODO(jansel): support this
+            assert width.is_integer  # TODO(jansel): support this
+            width = int(width)
+            var = str(r.name)
+            tiling = 16
+            options0.append(var)
+
+            if width % tiling == 0 and tiling > 1:
+                options1.append(var)
+                t0 = f"{var}_t0"
+                t1 = f"{var}_t1"
+                ranges[var] = [LoopRange(t0, width // tiling),
+                               LoopRange(t1, tiling)]
+                body = body.subs({var: S(f"{t0} * {tiling} + {t1}")})
+            else:
+                ranges[var] = [r]
+
+        loop_order = list(chain(reversed(options0),
+                                reversed(options1)))
+
+        new_ranges = []
+        for var in loop_order:
+            new_ranges.append(ranges[var].pop())
+        return Loops(reversed(new_ranges), body)
+
+    def split_loops(self, constants, limit=9, threshold=8):
+        conds = list(chain(*[c.tests for c in self.find_all(Condition)]))
+        assert not any(map(is_boolean, conds))
+        ranges = []
+        body = self.body
+        search = (constants["padding0"], 1)
+        for rng in reversed(self.ranges):
+            splits = []
+            if limit >= 1 and not is_false((rng.end - rng.begin) // rng.step >= threshold):
+                for offset in search:
+                    idx = rng.begin + offset * rng.step
+                    if (limit >= 1 and is_true(idx < rng.end) and
+                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
+                        splits.append(idx)
+                        break
+
+                for offset in search:
+                    idx = rng.begin + ((rng.end - rng.begin) // rng.step - offset) * rng.step
+                    if (limit >= 1 and is_true(idx >= rng.begin) and
+                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
+                        splits.append(idx)
+                        break
+            if splits:
+                assert len(splits) == 1 or is_true(splits[0] < splits[1])
+                split_ranges = []
+                for split in splits:
+                    split_ranges.append(LoopRange(
+                        rng.name, rng.begin, split, rng.step
+                    ))
+                    rng = LoopRange(
+                        rng.name, split, rng.end, rng.step
+                    )
+                split_ranges.append(rng)
+                body = Loops(ranges, body)
+                body = Block([Loops([x], body.copy()) for x in split_ranges])
+                ranges.clear()
+                limit /= len(splits)
+                continue
+            ranges.insert(0, rng)
+        return Loops(ranges, body)
 
 
 class Condition(Node):
@@ -558,9 +635,11 @@ class ConvolutionGenerator(object):
                      Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
                     "v0 * v1"))).subs(macros).subs(self.constants)
 
-        self.simplify_conditionals()
-        self.run_pass(self.split_loops_pass)
-        self.simplify_conditionals()
+        # Some ad-hoc compiler passes
+        self.body = self.body.simplify_conditionals(dict(), dict())
+        self.body = self.body.tiling_and_reorder()
+        self.body = self.body.split_loops(self.constants)
+        self.body = self.body.simplify_conditionals(dict(), dict())
         self.body, _, _ = self.body.vectorize_loops()
         self.body, _ = self.body.cache_writes()
         self.print()
@@ -574,62 +653,8 @@ class ConvolutionGenerator(object):
         )
         self.compiled = getattr(getattr(torch.ops, self.name), self.name)
 
-    def simplify_conditionals(self):
-        self.body = self.body.simplify_conditionals(dict(), dict())
-
     def print(self):
         VERBOSE and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
-
-    def run_pass(self, pass_fn, target_cls=Loops):
-        def wrapper(node):
-            if isinstance(node, target_cls):
-                return pass_fn(node)
-            return node
-
-        self.print()
-        VERBOSE and print(f"\n{pass_fn.__qualname__}")
-        self.body = self.body.apply_node(wrapper)
-
-    def split_loops_pass(self, loops: Loops, limit=3, threshold=8):
-        conds = list(chain(*[c.tests for c in loops.find_all(Condition)]))
-        assert not any(map(is_boolean, conds))
-        ranges = []
-        body = loops.body
-        search = (self.constants["padding0"], 1)
-        for rng in reversed(loops.ranges):
-            splits = []
-            if limit >= 1 and not is_false((rng.end - rng.begin) // rng.step >= threshold):
-                for offset in search:
-                    idx = rng.begin + offset * rng.step
-                    if (limit >= 1 and is_true(idx < rng.end) and
-                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
-                        splits.append(idx)
-                        break
-
-                for offset in search:
-                    idx = rng.begin + ((rng.end - rng.begin) // rng.step - offset) * rng.step
-                    if (limit >= 1 and is_true(idx >= rng.begin) and
-                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
-                        splits.append(idx)
-                        break
-            if splits:
-                assert len(splits) == 1 or is_true(splits[0] < splits[1])
-                split_ranges = []
-                for split in splits:
-                    split_ranges.append(LoopRange(
-                        rng.name, rng.begin, split, rng.step
-                    ))
-                    rng = LoopRange(
-                        rng.name, split, rng.end, rng.step
-                    )
-                split_ranges.append(rng)
-                body = Loops(ranges, body)
-                body = Block([Loops([x], body.copy()) for x in split_ranges])
-                ranges.clear()
-                limit /= len(splits)
-                continue
-            ranges.insert(0, rng)
-        return Loops(ranges, body)
 
     def __str__(self):
         return f"""
@@ -697,10 +722,18 @@ def test_conv(conv: torch.nn.Conv2d, image: torch.Tensor):
     sec1 = timeit.timeit(lambda: conv(image), number=TIMES)
     sec2 = timeit.timeit(lambda: cg(image), number=TIMES)
     gf = gflops(conv, image) * TIMES
-    print(f"{gf / sec1:.1f} gflops => {gf / sec2:.1f} gflops - {sec1 / sec2:.2f}x")
-    if sec2 < sec1:
+    return gf / sec1, gf / sec2, sec1 / sec2
+
+
+def test(conv_args, input_shape):
+    print(f"{conv_args}/{input_shape}")
+    pytorch, autotuned, speedup = test_conv(torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
+    print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
+    results_csv.writerow([repr(conv_args), repr(input_shape),
+                          f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
+    if speedup >= 1:
         stats["speedup_count"] += 1
-        stats["speedup_factor"] += sec1 / sec2
+        stats["speedup_factor"] += speedup
     stats["total"] += 1
 
 
@@ -720,6 +753,8 @@ def unittests():
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
+    global results_csv
     global VERBOSE
     VERBOSE = True
 
@@ -759,7 +794,16 @@ def main():
         )
         return
 
+    if False:
+        test_conv(
+            torch.nn.Conv2d(64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
+            torch.randn(32, 64, 56, 56)
+        )
+        return
+
     VERBOSE = False
+    results_csv = csv.writer(open("results.csv", "w"))
+    results_csv.writerow(["conv2d", "input", "pytorch_gflops", "autotuner_gflops", "speedup"])
 
     first = Once()
     testcases = pd.read_csv("testcases.csv").sort_values("gflops")
@@ -767,14 +811,12 @@ def main():
         conv_args = literal_eval(row["conv2d"])
         input_shape = literal_eval(row["input"])
         if first(conv_args, input_shape):
-            print(f"{conv_args}/{input_shape}")
-            test_conv(torch.nn.Conv2d(*conv_args),
-                      torch.randn(input_shape))
-        if len(first) > 50:
+            test(conv_args, input_shape)
+        if len(first) > 49:
             break
 
     stats["speedup_factor"] /= max(1, stats["speedup_count"])
-    print(sorted(stats.items()))
+    print("STATS", sorted(stats.items()))
 
 
 if __name__ == "__main__":
