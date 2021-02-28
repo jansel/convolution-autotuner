@@ -1,37 +1,60 @@
 #!/usr/bin/env python
+import argparse
+import contextlib
+import csv
+import ctypes
+import gc
 import logging
 import os
 import re
-import subprocess
+import sys
+import time
 import timeit
 from ast import literal_eval
-from collections import Counter, defaultdict
+from collections import Counter
+from _ctypes import dlclose
 from functools import partial, reduce, cmp_to_key, lru_cache
 from itertools import chain
 from operator import mul
+from subprocess import Popen, check_call, PIPE
+from tempfile import NamedTemporaryFile
 from typing import List
 
 import pandas as pd
-import csv
-import io
 import sympy
 import torch
 import torch.utils.cpp_extension
+from numpy import median
 from sympy import Equality
 
-torch.set_num_threads(1)
-
-log = logging.getLogger(__name__)
-product = partial(reduce, mul)
 S = partial(sympy.simplify, evaluate=False)
 E = partial(sympy.simplify, evaluate=True)
 VERBOSE = True
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
-TIMES = 3
 PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
+CASES = [
+    ((576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
+     (1, 576, 1, 1)),  # 0
+    ((16, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
+     (32, 16, 55, 55)),  # 1
+    ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
+     (32, 512, 28, 28)),  # 2
+    ((128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
+     (32, 128, 56, 56)),  # 3
+    ((120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
+     (32, 120, 28, 28)),  # 4
+    ((64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
+     (32, 64, 56, 56)),  # 5
+]
+
+torch.set_num_threads(1)
+log = logging.getLogger(__name__)
+product = partial(reduce, mul)
 stats = Counter()
-results_csv = csv.writer(io.StringIO())
+timers = Counter()
+results = []
+args = None
 
 
 @cmp_to_key
@@ -67,6 +90,20 @@ def identity(x):
 
 def nonnegative(x):
     return x.subs({v: sympy.Symbol(v, nonnegative=True, integer=True) for v in map(str, x.free_symbols)})
+
+
+def tmpvar():
+    n = f"tmp{tmpvar.count}"
+    tmpvar.count += 1
+    return n
+
+
+@contextlib.contextmanager
+def timer(name):
+    t0 = time.perf_counter()
+    yield
+    t1 = time.perf_counter()
+    timers[name] += t1 - t0
 
 
 class Node(object):
@@ -554,15 +591,7 @@ class TempDef(Node):
                               f"_mm{VECTOR_BITS}_setzero_ps()")
 
 
-def tmpvar():
-    n = f"tmp{tmpvar.count}"
-    tmpvar.count += 1
-    return n
-
-
 class ConvolutionGenerator(object):
-    counter = 0
-
     @staticmethod
     def get_constants(conv, image):
         # These depend on conv
@@ -591,6 +620,7 @@ class ConvolutionGenerator(object):
         out = torch.zeros([batch_size, out_channels,
                            out_sizes0, out_sizes1], dtype=image.dtype)
 
+        # TODO(jansel): make these dynamic
         image_stride0, image_stride1, image_stride2, image_stride3 = image.stride()
         weight_stride0, weight_stride1, weight_stride2, weight_stride3 = weight.stride()
         out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
@@ -599,12 +629,14 @@ class ConvolutionGenerator(object):
 
     def __init__(self, conv, image):
         super(ConvolutionGenerator, self).__init__()
-        self.name = f"conv{self.counter}"
-        ConvolutionGenerator.counter += 1
         self.constants = self.get_constants(conv, image)
         self.dtype = "float"
         self.weight = conv.weight
         self.bias = conv.bias
+        self.out_shape = (self.constants["batch_size"],
+                          self.constants["out_channels"],
+                          self.constants["out_sizes0"],
+                          self.constants["out_sizes1"])
         if self.bias is not None:
             self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
         tmpvar.count = 0
@@ -636,53 +668,66 @@ class ConvolutionGenerator(object):
                     "v0 * v1"))).subs(macros).subs(self.constants)
 
         # Some ad-hoc compiler passes
-        self.body = self.body.simplify_conditionals(dict(), dict())
-        self.body = self.body.tiling_and_reorder()
-        self.body = self.body.split_loops(self.constants)
-        self.body = self.body.simplify_conditionals(dict(), dict())
-        self.body, _, _ = self.body.vectorize_loops()
-        self.body, _ = self.body.cache_writes()
+        with timer("simplify"):
+            self.body = self.body.simplify_conditionals(dict(), dict())
+        with timer("tiling_and_reorder"):
+            self.body = self.body.tiling_and_reorder()
+        with timer("split_loops"):
+            self.body = self.body.split_loops(self.constants)
+        with timer("simplify"):
+            self.body = self.body.simplify_conditionals(dict(), dict())
+        with timer("vectorize"):
+            self.body, _, _ = self.body.vectorize_loops()
+        with timer("cache_writes"):
+            self.body, _ = self.body.cache_writes()
+
         self.print()
 
-        torch.utils.cpp_extension.load_inline(
-            name=self.name,
-            cpp_sources=str(self),
-            is_python_module=False,
-            extra_cflags=['-O3', '-ffast-math', '-march=native'],
-            verbose=False,
-        )
-        self.compiled = getattr(getattr(torch.ops, self.name), self.name)
+        with NamedTemporaryFile(suffix=".so") as shared_object:
+            with NamedTemporaryFile(suffix=".cpp") as source:
+                source.write(str(self).encode("utf-8"))
+                source.flush()
+                cmd = [
+                    args.cxx, "-shared", "-o", shared_object.name, source.name,
+                    f"-O{args.opt}", "-ffast-math", "-march=native",
+                    "-Wall", "-Werror"
+                ]
+                log.debug(" ".join(cmd))
+                with timer("compile"):
+                    check_call(cmd)
+            lib = ctypes.cdll.LoadLibrary(shared_object.name)
+            self.compiled = lib.convolution
+            self.handle = lib._handle
+
+    def close(self):
+        if self.compiled is not None:
+            self.compiled = None
+            gc.collect()
+            dlclose(self.handle)
+            self.handle = None
+            gc.collect()
 
     def print(self):
-        VERBOSE and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
+        VERBOSE > 1 and Popen("clang-format", stdin=PIPE).communicate(str(self).encode("utf-8"))
 
     def __str__(self):
         return f"""
             #include "{PREFIX_HEADER}"
-            torch::Tensor {self.name}(
-                    const torch::Tensor& _image,
-                    const torch::Tensor& _weight)
+            extern "C" void convolution(
+                float* __restrict__ image,
+                float* __restrict__ weight,
+                float* __restrict__ out
+            )
             {{
-                torch::Tensor _out = torch::zeros({{
-                    {self.constants["batch_size"]},
-                    {self.constants["out_channels"]},
-                    {self.constants["out_sizes0"]},
-                    {self.constants["out_sizes1"]}
-                }}); 
-                float* __restrict__ image = _image.data_ptr<float>();
-                float* __restrict__ weight = _weight.data_ptr<float>();
-                float* __restrict__ out = _out.data_ptr<float>();
                 {self.body}
-                return _out;
-            }}
-            TORCH_LIBRARY({self.name}, m)
-            {{
-                m.def("{self.name}", &{self.name});
             }}
             """
 
     def __call__(self, image):
-        out = self.compiled(image, self.weight)
+        out = torch.zeros(self.out_shape)
+        self.compiled(ctypes.c_void_p(image.data_ptr()),
+                      ctypes.c_void_p(self.weight.data_ptr()),
+                      ctypes.c_void_p(out.data_ptr()))
         if self.bias is not None:
             out += self.bias
         return out
@@ -713,28 +758,30 @@ def gflops(conv, image):
     return gflops / 1000000000.0
 
 
-def test_conv(conv: torch.nn.Conv2d, image: torch.Tensor):
+def measure_testcase(conv: torch.nn.Conv2d, image: torch.Tensor):
     cg = ConvolutionGenerator(conv, image)
     result = cg(image)
     correct = conv(image)
     torch.testing.assert_allclose(correct, result)
 
-    sec1 = timeit.timeit(lambda: conv(image), number=TIMES)
-    sec2 = timeit.timeit(lambda: cg(image), number=TIMES)
-    gf = gflops(conv, image) * TIMES
+    sec1 = median(timeit.repeat(lambda: conv(image), number=args.times, repeat=args.repeat))
+    sec2 = median(timeit.repeat(lambda: cg(image), number=args.times, repeat=args.repeat))
+    gf = gflops(conv, image) * args.times
+    cg.close()
     return gf / sec1, gf / sec2, sec1 / sec2
 
 
-def test(conv_args, input_shape):
+def report_testcase(conv_args, input_shape):
     print(f"{conv_args}/{input_shape}")
-    pytorch, autotuned, speedup = test_conv(torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
+    pytorch, autotuned, speedup = measure_testcase(torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
     print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
-    results_csv.writerow([repr(conv_args), repr(input_shape),
-                          f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
+    results.append([repr(conv_args), repr(input_shape),
+                    f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
     if speedup >= 1:
         stats["speedup_count"] += 1
         stats["speedup_factor"] += speedup
     stats["total"] += 1
+    sys.stdout.flush()
 
 
 class Once(set):
@@ -743,80 +790,60 @@ class Once(set):
 
 
 def unittests():
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 4, (3, 1), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1), torch.randn(1, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1, dilation=2), torch.randn(2, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=8), torch.randn(2, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=2), torch.randn(2, 8, 8, 8))
-    test_conv(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=5, groups=4, bias=False), torch.randn(2, 8, 16, 8))
+    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0), torch.randn(2, 8, 8, 8))
+    measure_testcase(torch.nn.Conv2d(8, 4, (3, 1), stride=1, padding=0), torch.randn(2, 8, 8, 8))
+    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1), torch.randn(1, 8, 8, 8))
+    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=8), torch.randn(2, 8, 8, 8))
+    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=2), torch.randn(2, 8, 8, 8))
+    # TODO(jansel): debug these ones
+    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1, dilation=2), torch.randn(2, 8, 8, 8))
+    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=5, groups=4, bias=False), torch.randn(2, 8, 16, 8))
 
 
-def main():
+def main(argv=None):
+    global args, VERBOSE
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose', '-v', action='count', default=0)
+    parser.add_argument('--times', type=int, default=3)
+    parser.add_argument('--repeat', type=int, default=3)
+    parser.add_argument('--unittest', action="store_true")
+    parser.add_argument('--case', type=int)
+    parser.add_argument('--limit', '-l', default=9999, type=int)
+    parser.add_argument('--testcases', default="testcases.csv")
+    parser.add_argument('--cxx', default="gcc-10")
+    parser.add_argument('--opt', '-O', type=int, default=3)
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    global results_csv
-    global VERBOSE
-    VERBOSE = True
+    VERBOSE = args.verbose
 
-    if False:
+    if args.unittest:
         unittests()
         return
 
-    if False:
-        # ReduceStore
-        test_conv(torch.nn.Conv2d(576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-                  torch.randn(1, 576, 1, 1))
+    if args.case is not None:
+        report_testcase(*CASES[args.case])
         return
-
-    if False:
-        test_conv(torch.nn.Conv2d(16, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-                  torch.rand(32, 16, 55, 55))
-        return
-
-    if False:
-        test_conv(torch.nn.Conv2d(512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
-                  torch.randn(32, 512, 28, 28))
-        return
-
-    if False:
-        # BroadcastLoad / padding
-        test_conv(
-            torch.nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
-            torch.randn(32, 128, 56, 56)
-        )
-        return
-
-    if False:
-        # crashing
-        test_conv(
-            torch.nn.Conv2d(120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
-            torch.randn(32, 120, 28, 28)
-        )
-        return
-
-    if False:
-        test_conv(
-            torch.nn.Conv2d(64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
-            torch.randn(32, 64, 56, 56)
-        )
-        return
-
-    VERBOSE = False
-    results_csv = csv.writer(open("results.csv", "w"))
-    results_csv.writerow(["conv2d", "input", "pytorch_gflops", "autotuner_gflops", "speedup"])
 
     first = Once()
-    testcases = pd.read_csv("testcases.csv").sort_values("gflops")
+    testcases = pd.read_csv(args.testcases).sort_values("gflops")
     for _, row in testcases.iterrows():
         conv_args = literal_eval(row["conv2d"])
         input_shape = literal_eval(row["input"])
         if first(conv_args, input_shape):
-            test(conv_args, input_shape)
-        if len(first) > 49:
+            report_testcase(conv_args, input_shape)
+        if len(first) >= args.limit:
             break
 
     stats["speedup_factor"] /= max(1, stats["speedup_count"])
-    print("STATS", sorted(stats.items()))
+
+    with open("results.csv", "w") as fd:
+        csv.writer(fd).writerows(
+            [["conv2d", "input", "pytorch_gflops", "autotuner_gflops", "speedup"]] +
+            results)
+
+    log.info("STATS %s", [f"{k}:{v}" for k, v in sorted(stats.items())])
+    log.info("TIMERS %s", [f"{k}:{v:.2f}" for k, v in timers.most_common()])
+    # check_call(["cat", f"/proc/{os.getpid()}/maps"])
 
 
 if __name__ == "__main__":

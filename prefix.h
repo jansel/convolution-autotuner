@@ -1,4 +1,3 @@
-#include <torch/script.h>
 #include <immintrin.h>
 
 static inline int Max(int a, int b) {
