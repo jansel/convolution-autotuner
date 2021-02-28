@@ -1,9 +1,12 @@
 #!/usr/bin/env python
+import logging
+import os
 import re
 import subprocess
 import timeit
 from ast import literal_eval
-from functools import partial, reduce
+from collections import Counter
+from functools import partial, reduce, cmp_to_key, lru_cache
 from itertools import chain
 from operator import mul
 from typing import List
@@ -12,27 +15,55 @@ import pandas as pd
 import sympy
 import torch
 import torch.utils.cpp_extension
+from sympy import Equality
 
 torch.set_num_threads(1)
 
+log = logging.getLogger(__name__)
 product = partial(reduce, mul)
-S = partial(sympy.simplify, evaluate=True)
+S = partial(sympy.simplify, evaluate=False)
+E = partial(sympy.simplify, evaluate=True)
 VERBOSE = True
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
 TIMES = 3
+PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
+stats = Counter()
 
 
+@cmp_to_key
+def cmp_expr(a, b):
+    if is_true(S(a < b)):
+        return -1
+    elif is_true(S(a > b)):
+        return 1
+    else:
+        assert str(a) == str(b)
+        return 0
+
+
+@lru_cache(128)
 def is_true(x):
-    return isinstance(S(x), sympy.logic.boolalg.BooleanTrue)
+    return isinstance(E(nonnegative(x)), sympy.logic.boolalg.BooleanTrue)
 
 
+@lru_cache(128)
 def is_false(x):
-    return isinstance(S(x), sympy.logic.boolalg.BooleanFalse)
+    return isinstance(E(nonnegative(x)), sympy.logic.boolalg.BooleanFalse)
+
+
+@lru_cache(128)
+def is_boolean(x):
+    return isinstance(E(nonnegative(x)),
+                      (sympy.logic.boolalg.BooleanFalse, sympy.logic.boolalg.BooleanTrue))
 
 
 def identity(x):
     return x
+
+
+def nonnegative(x):
+    return x.subs({v: sympy.Symbol(v, nonnegative=True, integer=True) for v in map(str, x.free_symbols)})
 
 
 class Node(object):
@@ -78,8 +109,19 @@ class Node(object):
         self.visit(visitor)
         return result
 
+    def simplify(self):
+        return self.apply(identity, identity)
+
+    copy = simplify
+
+    def simplify_conditionals(self, first, last):
+        return self
+
 
 class LoopRange(Node):
+    def __str__(self):
+        return f"for(int {self.name} = {self.begin}; {self.name} < {self.end}; {self.name} += {self.step})"
+
     def __init__(self, name, begin, end=None, step=1):
         super(LoopRange, self).__init__()
         self.name = name
@@ -99,11 +141,11 @@ class LoopRange(Node):
         return (is_true(self.begin + VECTOR_SIZE <= self.end) and
                 S(((self.end - self.begin) // self.step) % VECTOR_SIZE) == 0)
 
-    def __str__(self):
-        return f"for(int {self.name} = {self.begin}; {self.name} < {self.end}; {self.name} += {self.step})"
-
 
 class Loops(Node):
+    def __str__(self):
+        return "\n".join(map(str, self.ranges + [self.body]))
+
     def __init__(self, ranges, body):
         super(Loops, self).__init__()
         self.ranges: List[LoopRange] = list(ranges)
@@ -123,11 +165,111 @@ class Loops(Node):
                 new_ranges.append(r)
         return node_fn(Loops(new_ranges, body))
 
-    def __str__(self):
-        return "\n".join(map(str, self.ranges + [self.body]))
+    def simplify_conditionals(self, first, last):
+        first = dict(first)
+        last = dict(last)
+        for rng in self.ranges:
+            first[rng.name] = S(rng.begin.subs(first))
+            last[rng.name] = S((rng.end - 1).subs(last))
+        return Loops(self.ranges, self.body.simplify_conditionals(first, last))
+
+    def cache_writes(self):
+        body, stores = self.body.cache_writes()
+        stores = set(stores)
+        ranges = []
+        seen = []
+        defs = []
+        sums = []
+
+        def do_caching(store):
+            nonlocal defs, sums, body, seen
+
+            def matches(n):
+                return store.name == n.name and is_true(Equality(store.index, n.index))
+
+            if any(map(matches, seen)):
+                return
+            seen.append(store)
+            var = tmpvar()
+            if isinstance(store, ReduceStore):
+                defs.append(TempDef(var).vectorize())
+            else:
+                defs.append(TempDef(var))
+            sums.append(Sum(store, [TempRef(var)], "v0"))
+
+            def swap(n):
+                if isinstance(n, (Store, ReduceStore)) and matches(n):
+                    return TempRef(var)
+                return n
+
+            body = body.apply_node(swap)
+
+        for rng in reversed(self.ranges):
+            stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
+            if ranges:
+                for store in stores - stores_idep:
+                    do_caching(store)
+            stores = stores_idep
+
+            if defs or sums:
+                body = Block(defs + [Loops(ranges, body)] + sums)
+                ranges = [rng]
+                defs.clear()
+                sums.clear()
+            else:
+                ranges.insert(0, rng)
+
+        for store in stores:
+            do_caching(store)
+        if defs or sums:
+            return Block(defs + [Loops(ranges, body)] + sums), []
+        else:
+            return Loops(ranges, body), []
+
+    def vectorize_loops(self):
+        body, memory, banned = self.body.vectorize_loops()
+        if any(m is False for m in memory):
+            return self, [False], banned
+        assert all(isinstance(x, str) for x in banned)
+        assert all(isinstance(x, Memory) for x in memory)
+        ranges = []
+        first = True
+        for rng in reversed(self.ranges):
+            diffs = [sympy.diff(s.index, rng.name) for s in memory]
+            if (first and
+                    str(rng.name) not in banned and
+                    all((x == 0 or x == 1) for x in diffs) and
+                    any(x == 1 for x in diffs) and
+                    rng.can_vectorize()):
+                def swap(n):
+                    if isinstance(n, Memory):
+                        delta = sympy.diff(n.index, rng.name)
+                        if delta == 1:
+                            return n.vectorize()
+                        assert delta == 0
+                        return n.broadcast()
+                    return n
+
+                body = body.apply_node(swap)
+                ranges.append(LoopRange(
+                    rng.name,
+                    rng.begin,
+                    rng.end,
+                    rng.step * VECTOR_SIZE
+                ))
+                first = False
+            else:
+                ranges.append(rng)
+        if not first:
+            memory = [False]  # stop
+        return Loops(reversed(ranges), body), memory, banned
 
 
 class Condition(Node):
+    def __str__(self):
+        test = " && ".join(map(str, self.tests))
+        return f"if({test})\n{self.body}"
+
     def __init__(self, tests, body):
         super(Condition, self).__init__()
         self.tests: List[sympy.Expr] = list(map(S, tests))
@@ -143,9 +285,30 @@ class Condition(Node):
             return None
         return node_fn(Condition(tests, body))
 
-    def __str__(self):
-        test = " && ".join(map(str, self.tests))
-        return f"if({test})\n{self.body}"
+    def simplify_conditionals(self, first_sub, last_sub):
+        tests = []
+        for t in self.tests:
+            # this assumes conditionals are monotonic
+            first = t.subs(first_sub)
+            last = t.subs(last_sub)
+            if is_true(first) and is_true(last):
+                tests.append(S(True))
+            elif is_false(first) and is_false(last):
+                tests.append(S(False))
+            else:
+                tests.append(t)
+        return Condition(tests, self.body.simplify_conditionals(first, last)).simplify()
+
+    def cache_writes(self):
+        body, stores = self.body.cache_writes()
+        return Condition(self.tests, body), stores
+
+    def vectorize_loops(self):
+        body, memory, banned = self.body.vectorize_loops()
+        banned = reduce(set.union, [banned] + [
+            set(map(str, t.free_symbols)) for t in self.tests
+        ])
+        return Condition(self.tests, body), memory, banned
 
 
 class Reduction(Node):
@@ -160,6 +323,12 @@ class Reduction(Node):
         inputs = [x.apply(node_fn, expr_fn) for x in self.inputs]
         expression = expr_fn(self.expression)
         return node_fn(self.__class__(output, inputs, expression))
+
+    def cache_writes(self):
+        return self, self.find_all((Store, ReduceStore))
+
+    def vectorize_loops(self):
+        return self, self.find_all(Memory), set()
 
 
 class Sum(Reduction):
@@ -193,6 +362,30 @@ class Block(Node):
 
     def __str__(self):
         return "{\n" + "\n".join(map(str, self.statements)) + "}\n"
+
+    def simplify_conditionals(self, first, last):
+        return Block([x.simplify_conditionals(first, last)
+                      for x in self.statements])
+
+    def cache_writes(self):
+        statements = []
+        stores = []
+        for s in self.statements:
+            a, b = s.cache_writes()
+            statements.append(a)
+            stores.extend(b)
+        return Block(statements), stores
+
+    def vectorize_loops(self):
+        statements = []
+        memory = []
+        banned = set()
+        for s in self.statements:
+            a, b, c = s.vectorize_loops()
+            statements.append(a)
+            memory.extend(b)
+            banned.update(c)
+        return Block(statements), memory, banned
 
 
 class Memory(Node):
@@ -284,6 +477,12 @@ class TempDef(Node):
                               f"_mm{VECTOR_BITS}_setzero_ps()")
 
 
+def tmpvar():
+    n = f"tmp{tmpvar.count}"
+    tmpvar.count += 1
+    return n
+
+
 class ConvolutionGenerator(object):
     counter = 0
 
@@ -331,7 +530,7 @@ class ConvolutionGenerator(object):
         self.bias = conv.bias
         if self.bias is not None:
             self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
-        self._tmpvar = 0
+        tmpvar.count = 0
 
         macros = {"in_channel": S("in_channel_g + g * (in_channels // groups)"),
                   "out_channel": S("out_channel_g + g * (out_channels // groups)"),
@@ -359,9 +558,11 @@ class ConvolutionGenerator(object):
                      Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
                     "v0 * v1"))).subs(macros).subs(self.constants)
 
-        self.run_pass(self.simplify_conditionals_pass)
-        self.run_pass(self.vectorize_pass)
-        self.run_pass(self.cache_writes_pass)
+        self.simplify_conditionals()
+        self.run_pass(self.split_loops_pass)
+        self.simplify_conditionals()
+        self.body, _, _ = self.body.vectorize_loops()
+        self.body, _ = self.body.cache_writes()
         self.print()
 
         torch.utils.cpp_extension.load_inline(
@@ -373,13 +574,11 @@ class ConvolutionGenerator(object):
         )
         self.compiled = getattr(getattr(torch.ops, self.name), self.name)
 
+    def simplify_conditionals(self):
+        self.body = self.body.simplify_conditionals(dict(), dict())
+
     def print(self):
         VERBOSE and subprocess.Popen("clang-format", stdin=subprocess.PIPE).communicate(str(self).encode("utf-8"))
-
-    def tmpvar(self):
-        n = f"tmp{self._tmpvar}"
-        self._tmpvar += 1
-        return n
 
     def run_pass(self, pass_fn, target_cls=Loops):
         def wrapper(node):
@@ -388,111 +587,53 @@ class ConvolutionGenerator(object):
             return node
 
         self.print()
-        VERBOSE and print(pass_fn.__qualname__)
+        VERBOSE and print(f"\n{pass_fn.__qualname__}")
         self.body = self.body.apply_node(wrapper)
 
-    def vectorize_pass(self, loops: Loops, direction=reversed):
-        memory = loops.find_all(Memory)
-        conds = reduce(set.union,
-                       [set(map(str, t.free_symbols)) for t in chain(*[c.tests for c in loops.find_all(Condition)])],
-                       set())
+    def split_loops_pass(self, loops: Loops, limit=3, threshold=8):
+        conds = list(chain(*[c.tests for c in loops.find_all(Condition)]))
+        assert not any(map(is_boolean, conds))
         ranges = []
         body = loops.body
-        first = True
-        for rng in direction(loops.ranges):
-            diffs = [sympy.diff(s.index, rng.name) for s in memory]
-            if (first and
-                    rng.name not in conds and
-                    all((x == 0 or x == 1) for x in diffs) and
-                    any(x == 1 for x in diffs) and
-                    rng.can_vectorize()):
-                def swap(n):
-                    if isinstance(n, Memory):
-                        delta = sympy.diff(n.index, rng.name)
-                        if delta == 1:
-                            return n.vectorize()
-                        assert delta == 0
-                        return n.broadcast()
-                    return n
-
-                body = body.apply_node(swap)
-                ranges.append(LoopRange(
-                    rng.name,
-                    rng.begin,
-                    rng.end,
-                    rng.step * VECTOR_SIZE
-                ))
-                first = False
-            else:
-                ranges.append(rng)
-        return Loops(direction(ranges), body)
-
-    def cache_writes_pass(self, loops: Loops):
-        stores = set(chain(*[s.find_all((Store, ReduceStore)) for s in loops.find_all(Sum)]))
-        ranges = []
-        body = loops.body
+        search = (self.constants["padding0"], 1)
         for rng in reversed(loops.ranges):
-            stores_idep = {s for s in stores if sympy.diff(s.index, rng.name) == 0}
-            defs = []
-            sums = []
-            if ranges:
-                for store in stores - stores_idep:
-                    var = self.tmpvar()
-                    if isinstance(store, ReduceStore):
-                        defs.append(TempDef(var).vectorize())
-                    else:
-                        defs.append(TempDef(var))
-                    sums.append(Sum(store, [TempRef(var)], "v0"))
+            splits = []
+            if limit >= 1 and not is_false((rng.end - rng.begin) // rng.step >= threshold):
+                for offset in search:
+                    idx = rng.begin + offset * rng.step
+                    if (limit >= 1 and is_true(idx < rng.end) and
+                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
+                        splits.append(idx)
+                        break
 
-                    def swap(n):
-                        if isinstance(n, (Store, ReduceStore)) and str(store) == str(n):
-                            return TempRef(var)
-                        return n
-
-                    body = body.apply_node(swap)
-            if defs or sums:
-                body = Block(defs + [Loops(ranges, body)] + sums)
-                ranges = [rng]
-            else:
-                ranges.insert(0, rng)
-            stores = stores_idep
+                for offset in search:
+                    idx = rng.begin + ((rng.end - rng.begin) // rng.step - offset) * rng.step
+                    if (limit >= 1 and is_true(idx >= rng.begin) and
+                            any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
+                        splits.append(idx)
+                        break
+            if splits:
+                assert len(splits) == 1 or is_true(splits[0] < splits[1])
+                split_ranges = []
+                for split in splits:
+                    split_ranges.append(LoopRange(
+                        rng.name, rng.begin, split, rng.step
+                    ))
+                    rng = LoopRange(
+                        rng.name, split, rng.end, rng.step
+                    )
+                split_ranges.append(rng)
+                body = Loops(ranges, body)
+                body = Block([Loops([x], body.copy()) for x in split_ranges])
+                ranges.clear()
+                limit /= len(splits)
+                continue
+            ranges.insert(0, rng)
         return Loops(ranges, body)
-
-    def simplify_conditionals_pass(self, loops: Loops):
-        first_value = {}
-        last_value = {}
-        for rng in loops.ranges:
-            first_value[rng.name] = S(rng.begin.subs(first_value))
-            last_value[rng.name] = S((rng.end - 1).subs(last_value))
-
-        def visit(node):
-            if isinstance(node, Condition):
-                tests = []
-                for t in node.tests:
-                    # this pass assumes conditionals are monotonic
-                    first = S(t.subs(first_value))
-                    last = S(t.subs(last_value))
-                    if is_true(first) and is_true(last):
-                        tests.append(S(True))
-                    elif is_false(first) and is_false(last):
-                        tests.append(S(False))
-                    else:
-                        tests.append(t)
-                return Condition(tests, node.body).apply_expr(identity)
-            return node
-
-        return loops.apply_node(visit)
 
     def __str__(self):
         return f"""
-            #include <torch/script.h>
-            #include <immintrin.h>
-            static inline float _mm256_reduce_add_ps(__m256 x) {{
-                const __m128 x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
-                const __m128 x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
-                const __m128 x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
-                return _mm_cvtss_f32(x32);
-            }}
+            #include "{PREFIX_HEADER}"
             torch::Tensor {self.name}(
                     const torch::Tensor& _image,
                     const torch::Tensor& _weight)
@@ -557,6 +698,10 @@ def test_conv(conv: torch.nn.Conv2d, image: torch.Tensor):
     sec2 = timeit.timeit(lambda: cg(image), number=TIMES)
     gf = gflops(conv, image) * TIMES
     print(f"{gf / sec1:.1f} gflops => {gf / sec2:.1f} gflops - {sec1 / sec2:.2f}x")
+    if sec2 < sec1:
+        stats["speedup_count"] += 1
+        stats["speedup_factor"] += sec1 / sec2
+    stats["total"] += 1
 
 
 class Once(set):
@@ -596,12 +741,21 @@ def main():
     if False:
         test_conv(torch.nn.Conv2d(512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
                   torch.randn(32, 512, 28, 28))
+        return
 
     if False:
         # BroadcastLoad / padding
         test_conv(
             torch.nn.Conv2d(128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
             torch.randn(32, 128, 56, 56)
+        )
+        return
+
+    if False:
+        # crashing
+        test_conv(
+            torch.nn.Conv2d(120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
+            torch.randn(32, 120, 28, 28)
         )
         return
 
@@ -617,7 +771,10 @@ def main():
             test_conv(torch.nn.Conv2d(*conv_args),
                       torch.randn(input_shape))
         if len(first) > 50:
-            return
+            break
+
+    stats["speedup_factor"] /= max(1, stats["speedup_count"])
+    print(sorted(stats.items()))
 
 
 if __name__ == "__main__":
