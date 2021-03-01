@@ -1,60 +1,34 @@
-#!/usr/bin/env python
-import argparse
 import contextlib
-import csv
 import ctypes
 import gc
 import logging
 import os
 import re
-import sys
 import time
-import timeit
-from ast import literal_eval
-from collections import Counter
 from _ctypes import dlclose
-from functools import partial, reduce, cmp_to_key, lru_cache
+from collections import Counter
+from functools import cmp_to_key, lru_cache, reduce
+from functools import partial
 from itertools import chain
-from operator import mul
-from subprocess import Popen, check_call, PIPE
+from subprocess import check_call, Popen, PIPE
 from tempfile import NamedTemporaryFile
 from typing import List
 
-import pandas as pd
 import sympy
 import torch
-import torch.utils.cpp_extension
-from numpy import median
-from sympy import Equality
 
 S = partial(sympy.simplify, evaluate=False)
 E = partial(sympy.simplify, evaluate=True)
-VERBOSE = True
+VERBOSE = False
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
 PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
-CASES = [
-    ((576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-     (1, 576, 1, 1)),  # 0
-    ((16, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-     (32, 16, 55, 55)),  # 1
-    ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 512, 28, 28)),  # 2
-    ((128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 128, 56, 56)),  # 3
-    ((120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
-     (32, 120, 28, 28)),  # 4
-    ((64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
-     (32, 64, 56, 56)),  # 5
-]
+CXX = "gcc-10"
+OPT = 3
 
-torch.set_num_threads(1)
+cfg = None
 log = logging.getLogger(__name__)
-product = partial(reduce, mul)
-stats = Counter()
 timers = Counter()
-results = []
-args = None
 
 
 @cmp_to_key
@@ -214,6 +188,8 @@ class Loops(Node):
         return Loops(self.ranges, self.body.simplify_conditionals(first, last))
 
     def cache_writes(self):
+        if cfg.boolean("skip_cache_writes"):
+            return self, None
         body, stores = self.body.cache_writes()
         stores = set(stores)
         ranges = []
@@ -225,7 +201,8 @@ class Loops(Node):
             nonlocal defs, sums, body, seen
 
             def matches(n):
-                return store.name == n.name and is_true(Equality(store.index, n.index))
+                return (store.name == n.name and
+                        is_true(sympy.Equality(store.index, n.index)))
 
             if any(map(matches, seen)):
                 return
@@ -267,6 +244,8 @@ class Loops(Node):
             return Loops(ranges, body), []
 
     def vectorize_loops(self):
+        if cfg.boolean("skip_vectorize"):
+            return self, None, None
         body, memory, banned = self.body.vectorize_loops()
         if any(m is False for m in memory):
             return self, [False], banned
@@ -316,10 +295,14 @@ class Loops(Node):
             assert width.is_integer  # TODO(jansel): support this
             width = int(width)
             var = str(r.name)
-            tiling = 16
             options0.append(var)
 
-            if width % tiling == 0 and tiling > 1:
+            max_tiling = 1
+            while (width % (max_tiling * 2)) == 0:
+                max_tiling *= 2
+
+            if max_tiling > 1:
+                tiling = cfg.power_of_two(f"tiling_{var}", 1, max_tiling)
                 options1.append(var)
                 t0 = f"{var}_t0"
                 t1 = f"{var}_t1"
@@ -329,15 +312,24 @@ class Loops(Node):
             else:
                 ranges[var] = [r]
 
-        loop_order = list(chain(reversed(options0),
-                                reversed(options1)))
+        loop_order = cfg.permutation(
+            "loop_order", list(chain(reversed(options0),
+                                     reversed(options1))))
 
         new_ranges = []
         for var in loop_order:
             new_ranges.append(ranges[var].pop())
+
+        assert all(len(x) == 0 for x in ranges.values())
+
         return Loops(reversed(new_ranges), body)
 
-    def split_loops(self, constants, limit=9, threshold=8):
+    def split_loops(self, constants):
+        limit = cfg.integer("split_loops_limit", 0, 4)  # exponential;
+        threshold = cfg.integer("split_loops_threshold", 3, 32)
+        if limit <= 0:
+            return self
+
         conds = list(chain(*[c.tests for c in self.find_all(Condition)]))
         assert not any(map(is_boolean, conds))
         ranges = []
@@ -373,7 +365,7 @@ class Loops(Node):
                 body = Loops(ranges, body)
                 body = Block([Loops([x], body.copy()) for x in split_ranges])
                 ranges.clear()
-                limit /= len(splits)
+                limit -= 1
                 continue
             ranges.insert(0, rng)
         return Loops(ranges, body)
@@ -627,7 +619,7 @@ class ConvolutionGenerator(object):
 
         return {k: v for k, v in locals().items() if isinstance(v, int)}
 
-    def __init__(self, conv, image):
+    def __init__(self, conv, image, dry_run=False):
         super(ConvolutionGenerator, self).__init__()
         self.constants = self.get_constants(conv, image)
         self.dtype = "float"
@@ -683,13 +675,17 @@ class ConvolutionGenerator(object):
 
         self.print()
 
+        if dry_run:
+            self.compiled, self.handle = None, None
+            return
+
         with NamedTemporaryFile(suffix=".so") as shared_object:
             with NamedTemporaryFile(suffix=".cpp") as source:
                 source.write(str(self).encode("utf-8"))
                 source.flush()
                 cmd = [
-                    args.cxx, "-shared", "-o", shared_object.name, source.name,
-                    f"-O{args.opt}", "-ffast-math", "-march=native",
+                    CXX, "-shared", "-o", shared_object.name, source.name,
+                    f"-O{OPT}", "-ffast-math", "-march=native",
                     "-Wall", "-Werror"
                 ]
                 log.debug(" ".join(cmd))
@@ -731,120 +727,3 @@ class ConvolutionGenerator(object):
         if self.bias is not None:
             out += self.bias
         return out
-
-
-def gflops(conv, image):
-    in_channels = conv.in_channels
-    out_channels = conv.out_channels
-    groups = conv.groups
-    padding = conv.padding
-    dilation = conv.dilation
-    kernel_size = list(conv.kernel_size)
-    stride = conv.stride
-    bias = conv.bias
-    batch_size, _, *in_sizes = image.shape
-    out_sizes = [
-        (v + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1) // stride[i] + 1
-        for i, v in enumerate(in_sizes)]
-    gflops = product([2,
-                      batch_size,
-                      groups,
-                      out_channels // groups,
-                      in_channels // groups] +
-                     out_sizes +
-                     kernel_size)
-    if bias is not None:
-        gflops += product([batch_size, out_channels] + out_sizes)
-    return gflops / 1000000000.0
-
-
-def measure_testcase(conv: torch.nn.Conv2d, image: torch.Tensor):
-    cg = ConvolutionGenerator(conv, image)
-    result = cg(image)
-    correct = conv(image)
-    torch.testing.assert_allclose(correct, result)
-
-    sec1 = median(timeit.repeat(lambda: conv(image), number=args.times, repeat=args.repeat))
-    sec2 = median(timeit.repeat(lambda: cg(image), number=args.times, repeat=args.repeat))
-    gf = gflops(conv, image) * args.times
-    cg.close()
-    return gf / sec1, gf / sec2, sec1 / sec2
-
-
-def report_testcase(conv_args, input_shape):
-    print(f"{conv_args}/{input_shape}")
-    pytorch, autotuned, speedup = measure_testcase(torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
-    print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
-    results.append([repr(conv_args), repr(input_shape),
-                    f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
-    if speedup >= 1:
-        stats["speedup_count"] += 1
-        stats["speedup_factor"] += speedup
-    stats["total"] += 1
-    sys.stdout.flush()
-
-
-class Once(set):
-    def __call__(self, *x):
-        return x not in self and (self.add(x) or True)
-
-
-def unittests():
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 4, (3, 1), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1), torch.randn(1, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=8), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=2), torch.randn(2, 8, 8, 8))
-    # TODO(jansel): debug these ones
-    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1, dilation=2), torch.randn(2, 8, 8, 8))
-    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=5, groups=4, bias=False), torch.randn(2, 8, 16, 8))
-
-
-def main(argv=None):
-    global args, VERBOSE
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--verbose', '-v', action='count', default=0)
-    parser.add_argument('--times', type=int, default=3)
-    parser.add_argument('--repeat', type=int, default=3)
-    parser.add_argument('--unittest', action="store_true")
-    parser.add_argument('--case', type=int)
-    parser.add_argument('--limit', '-l', default=9999, type=int)
-    parser.add_argument('--testcases', default="testcases.csv")
-    parser.add_argument('--cxx', default="gcc-10")
-    parser.add_argument('--opt', '-O', type=int, default=3)
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
-    VERBOSE = args.verbose
-
-    if args.unittest:
-        unittests()
-        return
-
-    if args.case is not None:
-        report_testcase(*CASES[args.case])
-        return
-
-    first = Once()
-    testcases = pd.read_csv(args.testcases).sort_values("gflops")
-    for _, row in testcases.iterrows():
-        conv_args = literal_eval(row["conv2d"])
-        input_shape = literal_eval(row["input"])
-        if first(conv_args, input_shape):
-            report_testcase(conv_args, input_shape)
-        if len(first) >= args.limit:
-            break
-
-    stats["speedup_factor"] /= max(1, stats["speedup_count"])
-
-    with open("results.csv", "w") as fd:
-        csv.writer(fd).writerows(
-            [["conv2d", "input", "pytorch_gflops", "autotuner_gflops", "speedup"]] +
-            results)
-
-    log.info("STATS %s", [f"{k}:{v}" for k, v in sorted(stats.items())])
-    log.info("TIMERS %s", [f"{k}:{v:.2f}" for k, v in timers.most_common()])
-    # check_call(["cat", f"/proc/{os.getpid()}/maps"])
-
-
-if __name__ == "__main__":
-    main()
