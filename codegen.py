@@ -4,12 +4,14 @@ import gc
 import logging
 import os
 import re
+import threading
 import time
 from _ctypes import dlclose
 from collections import Counter
 from functools import cmp_to_key, lru_cache, reduce
 from functools import partial
 from itertools import chain
+from multiprocessing import Process
 from subprocess import check_call, Popen, PIPE
 from tempfile import NamedTemporaryFile
 from typing import List
@@ -17,7 +19,7 @@ from typing import List
 import sympy
 import torch
 
-S = partial(sympy.simplify, evaluate=False)
+S = sympy.expand
 E = partial(sympy.simplify, evaluate=True)
 VERBOSE = False
 VECTOR_SIZE = 8
@@ -26,7 +28,7 @@ PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix
 CXX = "gcc-10"
 OPT = 3
 
-cfg = None
+tls = threading.local()
 log = logging.getLogger(__name__)
 timers = Counter()
 
@@ -166,6 +168,8 @@ class Loops(Node):
         self.body: Node = body
 
     def apply(self, node_fn, expr_fn):
+        if self.body is None:
+            return None
         body = self.body.apply(node_fn, expr_fn)
         if body is None:
             return None
@@ -188,7 +192,7 @@ class Loops(Node):
         return Loops(self.ranges, self.body.simplify_conditionals(first, last))
 
     def cache_writes(self):
-        if cfg.boolean("skip_cache_writes"):
+        if tls.cfg.boolean("skip_cache_writes"):
             return self, None
         body, stores = self.body.cache_writes()
         stores = set(stores)
@@ -244,7 +248,7 @@ class Loops(Node):
             return Loops(ranges, body), []
 
     def vectorize_loops(self):
-        if cfg.boolean("skip_vectorize"):
+        if tls.cfg.boolean("skip_vectorize"):
             return self, None, None
         body, memory, banned = self.body.vectorize_loops()
         if any(m is False for m in memory):
@@ -302,7 +306,7 @@ class Loops(Node):
                 max_tiling *= 2
 
             if max_tiling > 1:
-                tiling = cfg.power_of_two(f"tiling_{var}", 1, max_tiling)
+                tiling = tls.cfg.power_of_two(f"tiling_{var}", 1, max_tiling)
                 options1.append(var)
                 t0 = f"{var}_t0"
                 t1 = f"{var}_t1"
@@ -312,7 +316,7 @@ class Loops(Node):
             else:
                 ranges[var] = [r]
 
-        loop_order = cfg.permutation(
+        loop_order = tls.cfg.permutation(
             "loop_order", list(chain(reversed(options0),
                                      reversed(options1))))
 
@@ -325,8 +329,8 @@ class Loops(Node):
         return Loops(reversed(new_ranges), body)
 
     def split_loops(self, constants):
-        limit = cfg.integer("split_loops_limit", 0, 4)  # exponential;
-        threshold = cfg.integer("split_loops_threshold", 3, 32)
+        limit = tls.cfg.integer("split_loops_limit", 0, 4)  # exponential;
+        threshold = tls.cfg.integer("split_loops_threshold", 3, 32)
         if limit <= 0:
             return self
 
@@ -583,6 +587,84 @@ class TempDef(Node):
                               f"_mm{VECTOR_BITS}_setzero_ps()")
 
 
+def funcdef(body):
+    return f"""
+        #include "{PREFIX_HEADER}"
+        extern "C" void convolution(
+            float* __restrict__ image,
+            float* __restrict__ weight,
+            float* __restrict__ out
+        )
+        {{
+            {body}
+        }}
+        """
+
+
+def codegen_and_compile(cfg, constants, output_filename):
+    tls.cfg = cfg
+    tmpvar.count = 0
+
+    macros = {"in_channel": S("in_channel_g + g * (in_channels // groups)"),
+              "out_channel": S("out_channel_g + g * (out_channels // groups)"),
+              "in0": S("out0 * stride0 + kernel0 * dilation0 - padding0"),
+              "in1": S("out1 * stride1 + kernel1 * dilation1 - padding1"), }
+
+    # This defines the convolution algorithm
+    body = Loops(
+        [LoopRange("n", "batch_size"),
+         LoopRange("g", "groups"),
+         LoopRange("out_channel_g", "out_channels // groups"),
+         LoopRange("in_channel_g", "in_channels // groups"),
+         LoopRange("out0", "out_sizes0"),
+         LoopRange("out1", "out_sizes1"),
+         LoopRange("kernel0", "kernel_size0"),
+         LoopRange("kernel1", "kernel_size1")],
+        Condition(
+            ["0 <= in0",
+             "0 <= in1",
+             "in0 < in_sizes0",
+             "in1 < in_sizes1"],
+            Sum(
+                Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
+                [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
+                 Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
+                "v0 * v1"))).subs(macros).subs(constants)
+
+    # Some ad-hoc compiler passes
+    with timer("simplify"):
+        body = body.simplify_conditionals(dict(), dict())
+    with timer("tiling_and_reorder"):
+        body = body.tiling_and_reorder()
+    with timer("split_loops"):
+        body = body.split_loops(constants)
+    with timer("simplify"):
+        body = body.simplify_conditionals(dict(), dict()).simplify()
+    with timer("vectorize"):
+        body, _, _ = body.vectorize_loops()
+    with timer("cache_writes"):
+        body, _ = body.cache_writes()
+
+    print_code(body)
+
+    with NamedTemporaryFile(suffix=".cpp") as source:
+        source.write(funcdef(body).encode("utf-8"))
+        source.flush()
+        cmd = [
+            CXX, "-shared", "-o", output_filename, source.name,
+            f"-O{OPT}", "-ffast-math", "-march=native",
+            "-Wall", "-Werror"
+        ]
+        log.debug(" ".join(cmd))
+        with timer("compile"):
+            check_call(cmd)
+    tls.cfg = None
+
+
+def print_code(code):
+    VERBOSE and Popen("clang-format", stdin=PIPE).communicate(funcdef(code).encode("utf-8"))
+
+
 class ConvolutionGenerator(object):
     @staticmethod
     def get_constants(conv, image):
@@ -619,78 +701,29 @@ class ConvolutionGenerator(object):
 
         return {k: v for k, v in locals().items() if isinstance(v, int)}
 
-    def __init__(self, conv, image, dry_run=False):
+    def __init__(self, cfg, conv, image, subproc=False):
         super(ConvolutionGenerator, self).__init__()
-        self.constants = self.get_constants(conv, image)
-        self.dtype = "float"
+        constants = self.get_constants(conv, image)
         self.weight = conv.weight
         self.bias = conv.bias
-        self.out_shape = (self.constants["batch_size"],
-                          self.constants["out_channels"],
-                          self.constants["out_sizes0"],
-                          self.constants["out_sizes1"])
+        self.out_shape = (constants["batch_size"],
+                          constants["out_channels"],
+                          constants["out_sizes0"],
+                          constants["out_sizes1"])
         if self.bias is not None:
             self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
-        tmpvar.count = 0
-
-        macros = {"in_channel": S("in_channel_g + g * (in_channels // groups)"),
-                  "out_channel": S("out_channel_g + g * (out_channels // groups)"),
-                  "in0": S("out0 * stride0 + kernel0 * dilation0 - padding0"),
-                  "in1": S("out1 * stride1 + kernel1 * dilation1 - padding1"), }
-
-        # This defines the convolution algorithm
-        self.body = Loops(
-            [LoopRange("n", "batch_size"),
-             LoopRange("g", "groups"),
-             LoopRange("out_channel_g", "out_channels // groups"),
-             LoopRange("in_channel_g", "in_channels // groups"),
-             LoopRange("out0", "out_sizes0"),
-             LoopRange("out1", "out_sizes1"),
-             LoopRange("kernel0", "kernel_size0"),
-             LoopRange("kernel1", "kernel_size1")],
-            Condition(
-                ["0 <= in0",
-                 "0 <= in1",
-                 "in0 < in_sizes0",
-                 "in1 < in_sizes1"],
-                Sum(
-                    Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
-                    [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
-                     Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
-                    "v0 * v1"))).subs(macros).subs(self.constants)
-
-        # Some ad-hoc compiler passes
-        with timer("simplify"):
-            self.body = self.body.simplify_conditionals(dict(), dict())
-        with timer("tiling_and_reorder"):
-            self.body = self.body.tiling_and_reorder()
-        with timer("split_loops"):
-            self.body = self.body.split_loops(self.constants)
-        with timer("simplify"):
-            self.body = self.body.simplify_conditionals(dict(), dict())
-        with timer("vectorize"):
-            self.body, _, _ = self.body.vectorize_loops()
-        with timer("cache_writes"):
-            self.body, _ = self.body.cache_writes()
-
-        self.print()
-
-        if dry_run:
-            self.compiled, self.handle = None, None
-            return
 
         with NamedTemporaryFile(suffix=".so") as shared_object:
-            with NamedTemporaryFile(suffix=".cpp") as source:
-                source.write(str(self).encode("utf-8"))
-                source.flush()
-                cmd = [
-                    CXX, "-shared", "-o", shared_object.name, source.name,
-                    f"-O{OPT}", "-ffast-math", "-march=native",
-                    "-Wall", "-Werror"
-                ]
-                log.debug(" ".join(cmd))
-                with timer("compile"):
-                    check_call(cmd)
+            if subproc:
+                p = Process(target=codegen_and_compile, args=(cfg, constants, shared_object.name))
+                try:
+                    p.start()
+                    p.join()
+                except:
+                    p.kill()
+                    raise
+            else:
+                codegen_and_compile(cfg, constants, shared_object.name)
             lib = ctypes.cdll.LoadLibrary(shared_object.name)
             self.compiled = lib.convolution
             self.handle = lib._handle
@@ -702,22 +735,6 @@ class ConvolutionGenerator(object):
             dlclose(self.handle)
             self.handle = None
             gc.collect()
-
-    def print(self):
-        VERBOSE > 1 and Popen("clang-format", stdin=PIPE).communicate(str(self).encode("utf-8"))
-
-    def __str__(self):
-        return f"""
-            #include "{PREFIX_HEADER}"
-            extern "C" void convolution(
-                float* __restrict__ image,
-                float* __restrict__ weight,
-                float* __restrict__ out
-            )
-            {{
-                {self.body}
-            }}
-            """
 
     def __call__(self, image):
         out = torch.zeros(self.out_shape)

@@ -67,8 +67,8 @@ def gflops(conv, image):
     return gflops / 1000000000.0
 
 
-def measure_testcase(conv: torch.nn.Conv2d, image: torch.Tensor):
-    cg = codegen.ConvolutionGenerator(conv, image)
+def measure_testcase(cfg, conv: torch.nn.Conv2d, image: torch.Tensor):
+    cg = codegen.ConvolutionGenerator(cfg, conv, image)
     result = cg(image)
     correct = conv(image)
     torch.testing.assert_allclose(correct, result)
@@ -82,16 +82,25 @@ def measure_testcase(conv: torch.nn.Conv2d, image: torch.Tensor):
 
 def report_testcase(conv_args, input_shape):
     print(f"{conv_args}/{input_shape}")
-    check_call([
-        sys.executable,
-        "autotuner.py",
-        "--conv2d", repr(conv_args),
-        "--input", repr(input_shape),
-        "--test-limit=100",
-    ])
+    if args.autotune:
+        attempts = 5
+        for attempt in range(attempts):
+            try:
+                check_call([
+                    sys.executable,
+                    "autotuner.py",
+                    "--conv2d", repr(conv_args),
+                    "--input", repr(input_shape),
+                    "--test-limit=300",
+                ])
+                break
+            except:
+                log.exception("error in subproc")
+                if attempt == attempts - 1:
+                    raise
     cfg = json.load(open(f"./configs/{repr(conv_args)},{repr(input_shape)}.json"))
-    with patch.object(codegen, "cfg", ConfigProxy(cfg)):
-        pytorch, autotuned, speedup = measure_testcase(torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
+    pytorch, autotuned, speedup = measure_testcase(
+        ConfigProxy(cfg), torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
     print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
     results.append([repr(conv_args), repr(input_shape),
                     f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
@@ -102,34 +111,19 @@ def report_testcase(conv_args, input_shape):
     sys.stdout.flush()
 
 
-def unittests():
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 4, (3, 1), stride=1, padding=0), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1), torch.randn(1, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=8), torch.randn(2, 8, 8, 8))
-    measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=1, padding=0, groups=2), torch.randn(2, 8, 8, 8))
-    # TODO(jansel): debug these ones
-    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=1, dilation=2), torch.randn(2, 8, 8, 8))
-    # measure_testcase(torch.nn.Conv2d(8, 8, (3, 3), stride=2, padding=5, groups=4, bias=False), torch.randn(2, 8, 16, 8))
-
-
 def main(argv=None):
     global args
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='count', default=0)
     parser.add_argument('--times', type=int, default=3)
     parser.add_argument('--repeat', type=int, default=3)
-    parser.add_argument('--unittest', action="store_true")
     parser.add_argument('--case', type=int)
+    parser.add_argument('--autotune', action="store_true")
     parser.add_argument('--limit', '-l', default=9999, type=int)
     parser.add_argument('--testcases', default="testcases.csv")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     codegen.VERBOSE = args.verbose
-
-    if args.unittest:
-        unittests()
-        return
 
     if args.case is not None:
         report_testcase(*CASES[args.case])
