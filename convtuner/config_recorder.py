@@ -1,7 +1,7 @@
 from opentuner import ConfigurationManipulator, PermutationParameter, IntegerParameter
 from opentuner.search.manipulator import PowerOfTwoParameter, BooleanParameter
 
-from utils import Once
+from .utils import Once
 
 
 class ConfigRecorder(object):

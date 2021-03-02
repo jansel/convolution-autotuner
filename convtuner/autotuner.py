@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import argparse
 import ast
 import json
@@ -6,23 +5,20 @@ import logging
 import multiprocessing
 import os
 import timeit
-from unittest.mock import patch
 
 import opentuner
 import torch
-import threading
 from numpy import median
 from opentuner import Result
 from opentuner.measurement import MeasurementInterface
 from opentuner.search.manipulator import ConfigurationManipulator
 
-from codegen import ConvolutionGenerator
-from config_recorder import ConfigProxy, ConfigRecorder
-from evaluate import gflops
+from convtuner.codegen import ConvolutionGenerator
+from convtuner.config_recorder import ConfigProxy, ConfigRecorder
+from convtuner.utils import gflops
 
 log = logging.getLogger(__name__)
-lock = threading.Lock()
-REPEAT = 1
+REPEAT = 3
 
 parser = argparse.ArgumentParser(parents=opentuner.argparsers())
 parser.add_argument("--conv2d")
@@ -46,10 +42,11 @@ class ConvTuner(MeasurementInterface):
         self.conv = torch.nn.Conv2d(*conv_args)
         self.image = torch.randn(*input_shape)
 
+        # Dry run codegen to capture config
         cg = ConvolutionGenerator(ConfigRecorder(manipulator), self.conv, self.image, subproc=False)
         assert len(manipulator.params)
         sec = float(median(timeit.repeat(lambda: cg(self.image), number=1, repeat=10)))
-        self.times = max(1, int(0.1 / sec))
+        self.times = max(1, int(0.01 / sec))
 
         super(ConvTuner, self).__init__(
             args=args,
@@ -73,13 +70,12 @@ class ConvTuner(MeasurementInterface):
         return ConvolutionGenerator(ConfigProxy(cfg), self.conv, self.image, subproc=True)
 
     def run_precompiled(self, desired_result, input, limit, compile_result, id):
-        with lock:
-            try:
-                compile_result(self.image)  # warmup
-                sec = median(timeit.repeat(lambda: compile_result(self.image), number=self.times, repeat=REPEAT))
-                return Result(time=float(sec))
-            finally:
-                compile_result.close()
+        try:
+            compile_result(self.image)  # warmup
+            sec = median(timeit.repeat(lambda: compile_result(self.image), number=self.times, repeat=REPEAT))
+            return Result(time=float(sec))
+        finally:
+            compile_result.close()
 
     def save_final_config(self, configuration):
         cfg = configuration.data
@@ -91,11 +87,11 @@ class ConvTuner(MeasurementInterface):
             fd.write("\n")
 
     def config_filename(self):
-        os.path.exists("configs") or os.mkdir("configs")
+        os.path.exists("../configs") or os.mkdir("../configs")
         return f"./configs/{self.program_name()},{self.program_version()}.json"
 
 
-if __name__ == '__main__':
+def main(args):
     multiprocessing.set_start_method("spawn")
     opentuner.init_logging()
-    ConvTuner.main(parser.parse_args())
+    ConvTuner.main(parser.parse_args(args))

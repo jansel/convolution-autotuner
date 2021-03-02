@@ -1,13 +1,10 @@
-import contextlib
 import ctypes
 import gc
 import logging
 import os
 import re
 import threading
-import time
 from _ctypes import dlclose
-from collections import Counter
 from functools import cmp_to_key, lru_cache, reduce
 from functools import partial
 from itertools import chain
@@ -19,8 +16,8 @@ from typing import List
 import sympy
 import torch
 
-S = sympy.expand
-E = partial(sympy.simplify, evaluate=True)
+from convtuner.utils import timer
+
 VERBOSE = False
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
@@ -28,16 +25,17 @@ PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix
 CXX = "gcc-10"
 OPT = 3
 
+expand = sympy.expand
+simplify = partial(sympy.simplify, evaluate=True)
 tls = threading.local()
 log = logging.getLogger(__name__)
-timers = Counter()
 
 
 @cmp_to_key
 def cmp_expr(a, b):
-    if is_true(S(a < b)):
+    if is_true(simplify(a < b)):
         return -1
-    elif is_true(S(a > b)):
+    elif is_true(simplify(a > b)):
         return 1
     else:
         assert str(a) == str(b)
@@ -46,17 +44,17 @@ def cmp_expr(a, b):
 
 @lru_cache(128)
 def is_true(x):
-    return isinstance(E(nonnegative(x)), sympy.logic.boolalg.BooleanTrue)
+    return isinstance(simplify(nonnegative(x)), sympy.logic.boolalg.BooleanTrue)
 
 
 @lru_cache(128)
 def is_false(x):
-    return isinstance(E(nonnegative(x)), sympy.logic.boolalg.BooleanFalse)
+    return isinstance(simplify(nonnegative(x)), sympy.logic.boolalg.BooleanFalse)
 
 
 @lru_cache(128)
 def is_boolean(x):
-    return isinstance(E(nonnegative(x)),
+    return isinstance(simplify(nonnegative(x)),
                       (sympy.logic.boolalg.BooleanFalse, sympy.logic.boolalg.BooleanTrue))
 
 
@@ -72,14 +70,6 @@ def tmpvar():
     n = f"tmp{tmpvar.count}"
     tmpvar.count += 1
     return n
-
-
-@contextlib.contextmanager
-def timer(name):
-    t0 = time.perf_counter()
-    yield
-    t1 = time.perf_counter()
-    timers[name] += t1 - t0
 
 
 class Node(object):
@@ -143,9 +133,9 @@ class LoopRange(Node):
         self.name = name
         if end is None:  # mimic range()
             begin, end = 0, begin
-        self.begin = S(begin)
-        self.end = S(end)
-        self.step = S(step)
+        self.begin = expand(begin)
+        self.end = expand(end)
+        self.step = expand(step)
 
     def apply(self, node_fn, expr_fn):
         return node_fn(LoopRange(name=self.name,
@@ -155,7 +145,7 @@ class LoopRange(Node):
 
     def can_vectorize(self):
         return (is_true(self.begin + VECTOR_SIZE <= self.end) and
-                S(((self.end - self.begin) // self.step) % VECTOR_SIZE) == 0)
+                expand(((self.end - self.begin) // self.step) % VECTOR_SIZE) == 0)
 
 
 class Loops(Node):
@@ -176,8 +166,8 @@ class Loops(Node):
         new_ranges = []
         for r in self.ranges:
             r = r.apply(node_fn, expr_fn)
-            if (is_false(S(r.begin + r.step < r.end)) and
-                    is_true(S(r.begin < r.end))):
+            if (is_false(expand(r.begin + r.step < r.end)) and
+                    is_true(expand(r.begin < r.end))):
                 body = body.subs({r.name: r.begin})
             else:
                 new_ranges.append(r)
@@ -187,8 +177,8 @@ class Loops(Node):
         first = dict(first)
         last = dict(last)
         for rng in self.ranges:
-            first[rng.name] = S(rng.begin.subs(first))
-            last[rng.name] = S((rng.end - 1).subs(last))
+            first[rng.name] = expand(rng.begin.subs(first))
+            last[rng.name] = expand((rng.end - 1).subs(last))
         return Loops(self.ranges, self.body.simplify_conditionals(first, last))
 
     def cache_writes(self):
@@ -293,7 +283,7 @@ class Loops(Node):
         options1 = []
         body = self.body
         for r in self.ranges:
-            width = S(r.end - r.begin)
+            width = expand(r.end - r.begin)
             assert r.begin == 0  # TODO(jansel): support this
             assert r.step == 1  # TODO(jansel): support this
             assert width.is_integer  # TODO(jansel): support this
@@ -312,7 +302,7 @@ class Loops(Node):
                 t1 = f"{var}_t1"
                 ranges[var] = [LoopRange(t0, width // tiling),
                                LoopRange(t1, tiling)]
-                body = body.subs({var: S(f"{t0} * {tiling} + {t1}")})
+                body = body.subs({var: expand(f"{t0} * {tiling} + {t1}")})
             else:
                 ranges[var] = [r]
 
@@ -382,7 +372,7 @@ class Condition(Node):
 
     def __init__(self, tests, body):
         super(Condition, self).__init__()
-        self.tests: List[sympy.Expr] = list(map(S, tests))
+        self.tests: List[sympy.Expr] = list(map(expand, tests))
         self.body: Node = body
 
     def apply(self, node_fn, expr_fn):
@@ -402,9 +392,9 @@ class Condition(Node):
             first = t.subs(first_sub)
             last = t.subs(last_sub)
             if is_true(first) and is_true(last):
-                tests.append(S(True))
+                tests.append(expand(True))
             elif is_false(first) and is_false(last):
-                tests.append(S(False))
+                tests.append(expand(False))
             else:
                 tests.append(t)
         return Condition(tests, self.body.simplify_conditionals(first, last)).simplify()
@@ -426,7 +416,7 @@ class Reduction(Node):
         super(Reduction, self).__init__()
         self.output: Memory = output
         self.inputs: List[Memory] = list(inputs)
-        self.expression: sympy.Expr = S(expression)
+        self.expression: sympy.Expr = expand(expression)
 
     def apply(self, node_fn, expr_fn):
         output = self.output.apply(node_fn, expr_fn)
@@ -502,13 +492,13 @@ class Memory(Node):
     @classmethod
     def from_indices(cls, name, indices):
         assert isinstance(indices, list)
-        return cls(name, sum(sympy.Mul(S(v), S(f"{name}_stride{i}"))
+        return cls(name, sum(sympy.Mul(expand(v), expand(f"{name}_stride{i}"))
                              for i, v in enumerate(indices)))
 
     def __init__(self, name, index):
         super(Memory, self).__init__()
         self.name = name
-        self.index = S(index)
+        self.index = expand(index)
 
     def __str__(self):
         return f"{self.name}[{self.index}]"
@@ -605,10 +595,10 @@ def codegen_and_compile(cfg, constants, output_filename):
     tls.cfg = cfg
     tmpvar.count = 0
 
-    macros = {"in_channel": S("in_channel_g + g * (in_channels // groups)"),
-              "out_channel": S("out_channel_g + g * (out_channels // groups)"),
-              "in0": S("out0 * stride0 + kernel0 * dilation0 - padding0"),
-              "in1": S("out1 * stride1 + kernel1 * dilation1 - padding1"), }
+    macros = {"in_channel": expand("in_channel_g + g * (in_channels // groups)"),
+              "out_channel": expand("out_channel_g + g * (out_channels // groups)"),
+              "in0": expand("out0 * stride0 + kernel0 * dilation0 - padding0"),
+              "in1": expand("out1 * stride1 + kernel1 * dilation1 - padding1"), }
 
     # This defines the convolution algorithm
     body = Loops(
@@ -681,7 +671,8 @@ class ConvolutionGenerator(object):
         dilation0, dilation1 = dilation
         padding0, padding1 = padding
         kernel_size0, kernel_size1 = kernel_size
-        assert conv.padding_mode == "zeros"
+        assert dilation == (1, 1)  # TODO(jansel): fix dilation
+        assert conv.padding_mode == "zeros"  # TODO(jansel): support other padding
 
         # These depend on conv + image, plan to make these dynamic in the future
         batch_size, _, *in_sizes = image.shape
@@ -690,6 +681,7 @@ class ConvolutionGenerator(object):
             for i, v in enumerate(in_sizes)]
         in_sizes0, in_sizes1 = in_sizes
         out_sizes0, out_sizes1 = out_sizes
+        # TODO(jansel): support conv3d
 
         out = torch.zeros([batch_size, out_channels,
                            out_sizes0, out_sizes1], dtype=image.dtype)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import argparse
 import csv
 import json
@@ -7,19 +6,17 @@ import sys
 import timeit
 from ast import literal_eval
 from collections import Counter
-from functools import partial, reduce
-from operator import mul
 from subprocess import check_call
-from unittest.mock import patch
 
 import pandas as pd
 import torch
-import torch.utils.cpp_extension
+import torch.nn
 from numpy import median
 
-import codegen
-from config_recorder import ConfigProxy
-from utils import Once
+import convtuner.utils
+from convtuner import codegen
+from convtuner.config_recorder import ConfigProxy
+from convtuner.utils import gflops, Once
 
 CASES = [
     ((576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
@@ -34,37 +31,12 @@ CASES = [
      (32, 120, 28, 28)),  # 4
     ((64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
      (32, 64, 56, 56)),  # 5
+    ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
+     (32, 512, 28, 28))  # 6
 ]
-
 log = logging.getLogger(__name__)
 stats = Counter()
 results = []
-torch.set_num_threads(1)
-product = partial(reduce, mul)
-
-
-def gflops(conv, image):
-    in_channels = conv.in_channels
-    out_channels = conv.out_channels
-    groups = conv.groups
-    padding = conv.padding
-    dilation = conv.dilation
-    kernel_size = list(conv.kernel_size)
-    stride = conv.stride
-    batch_size, _, *in_sizes = image.shape
-    out_sizes = [
-        (v + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1) // stride[i] + 1
-        for i, v in enumerate(in_sizes)]
-    gflops = product([2,
-                      batch_size,
-                      groups,
-                      out_channels // groups,
-                      in_channels // groups] +
-                     out_sizes +
-                     kernel_size)
-    # if conv.bias is not None:
-    #    gflops += product([batch_size, out_channels] + out_sizes)
-    return gflops / 1000000000.0
 
 
 def measure_testcase(cfg, conv: torch.nn.Conv2d, image: torch.Tensor):
@@ -80,15 +52,15 @@ def measure_testcase(cfg, conv: torch.nn.Conv2d, image: torch.Tensor):
     return gf / sec1, gf / sec2, sec1 / sec2
 
 
-def report_testcase(conv_args, input_shape):
+def report_testcase(conv_args, input_shape, attempts=5):
     print(f"{conv_args}/{input_shape}")
     if args.autotune:
-        attempts = 5
         for attempt in range(attempts):
             try:
                 check_call([
                     sys.executable,
-                    "autotuner.py",
+                    sys.argv[0],
+                    "autotune",
                     "--conv2d", repr(conv_args),
                     "--input", repr(input_shape),
                     "--test-limit=300",
@@ -147,9 +119,4 @@ def main(argv=None):
             results)
 
     log.info("STATS %s", [f"{k}:{v}" for k, v in sorted(stats.items())])
-    log.info("TIMERS %s", [f"{k}:{v:.2f}" for k, v in codegen.timers.most_common()])
-    # check_call(["cat", f"/proc/{os.getpid()}/maps"])
-
-
-if __name__ == "__main__":
-    main()
+    log.info("TIMERS %s", [f"{k}:{v:.2f}" for k, v in convtuner.utils.timers.most_common()])
