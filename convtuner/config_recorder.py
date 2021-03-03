@@ -1,5 +1,5 @@
 from opentuner import ConfigurationManipulator, PermutationParameter, IntegerParameter
-from opentuner.search.manipulator import PowerOfTwoParameter, BooleanParameter
+from opentuner.search.manipulator import PowerOfTwoParameter, BooleanParameter, FloatParameter
 
 from .utils import Once
 
@@ -25,6 +25,11 @@ class ConfigRecorder(object):
             self.manipulator.add_parameter(IntegerParameter(name, min_value, max_value))
         return min_value
 
+    def float(self, name, min_value, max_value):
+        if self.first(name):
+            self.manipulator.add_parameter(FloatParameter(name, min_value, max_value))
+        return min_value
+
     def boolean(self, name):
         if self.first(name):
             self.manipulator.add_parameter(BooleanParameter(name))
@@ -43,6 +48,7 @@ class ConfigProxy(object):
     power_of_two = get
     integer = get
     boolean = get
+    float = get
 
 
 class DummyConfig(object):
@@ -57,3 +63,6 @@ class DummyConfig(object):
 
     def boolean(self, name):
         return False
+
+    def float(self, name, min_value, max_value):
+        return min_value

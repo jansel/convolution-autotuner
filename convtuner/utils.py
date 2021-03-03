@@ -1,8 +1,11 @@
 import contextlib
+import logging
 import time
 from collections import Counter
 from functools import partial, reduce
 from operator import mul
+
+log = logging.getLogger(__name__)
 
 
 class Once(set):
@@ -46,3 +49,13 @@ def timer(name):
 
 
 product = partial(reduce, mul)
+
+
+def retry(fn, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except:
+            log.exception("error retry loop")
+            if attempt == attempts - 1:
+                raise

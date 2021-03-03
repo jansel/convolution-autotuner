@@ -15,8 +15,8 @@ from numpy import median
 
 import convtuner.utils
 from convtuner import codegen
-from convtuner.config_recorder import ConfigProxy
-from convtuner.utils import gflops, Once
+from convtuner.config_recorder import ConfigProxy, DummyConfig
+from convtuner.utils import gflops, Once, retry
 
 CASES = [
     ((576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
@@ -32,7 +32,9 @@ CASES = [
     ((64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
      (32, 64, 56, 56)),  # 5
     ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 512, 28, 28))  # 6
+     (32, 512, 28, 28)),  # 6
+    ((120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
+     (32, 120, 28, 28)),  # 7
 ]
 log = logging.getLogger(__name__)
 stats = Counter()
@@ -52,27 +54,23 @@ def measure_testcase(cfg, conv: torch.nn.Conv2d, image: torch.Tensor):
     return gf / sec1, gf / sec2, sec1 / sec2
 
 
-def report_testcase(conv_args, input_shape, attempts=5):
+def report_testcase(conv_args, input_shape):
     print(f"{conv_args}/{input_shape}")
-    if args.autotune:
-        for attempt in range(attempts):
-            try:
-                check_call([
-                    sys.executable,
-                    sys.argv[0],
-                    "autotune",
-                    "--conv2d", repr(conv_args),
-                    "--input", repr(input_shape),
-                    "--test-limit=300",
-                ])
-                break
-            except:
-                log.exception("error in subproc")
-                if attempt == attempts - 1:
-                    raise
-    cfg = json.load(open(f"./configs/{repr(conv_args)},{repr(input_shape)}.json"))
+    if args.dummy:
+        cfg = DummyConfig()
+    else:
+        if args.autotune:
+            retry(lambda: check_call([
+                sys.executable,
+                sys.argv[0],
+                "autotune",
+                "--conv2d", repr(conv_args),
+                "--input", repr(input_shape),
+                f"--test-limit={args.test_limit}",
+            ]))
+        cfg = ConfigProxy(json.load(open(f"./configs/{repr(conv_args)},{repr(input_shape)}.json")))
     pytorch, autotuned, speedup = measure_testcase(
-        ConfigProxy(cfg), torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
+        cfg, torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
     print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
     results.append([repr(conv_args), repr(input_shape),
                     f"{pytorch:.4f}", f"{autotuned:.4f}", f"{speedup:.4f}"])
@@ -91,7 +89,9 @@ def main(argv=None):
     parser.add_argument('--repeat', type=int, default=3)
     parser.add_argument('--case', type=int)
     parser.add_argument('--autotune', action="store_true")
+    parser.add_argument('--dummy', action="store_true")
     parser.add_argument('--limit', '-l', default=9999, type=int)
+    parser.add_argument('--test-limit', default=500, type=int)
     parser.add_argument('--testcases', default="testcases.csv")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
@@ -101,15 +101,16 @@ def main(argv=None):
         report_testcase(*CASES[args.case])
         return
 
-    first = Once()
-    testcases = pd.read_csv(args.testcases).sort_values("gflops")
-    for _, row in testcases.iterrows():
-        conv_args = literal_eval(row["conv2d"])
-        input_shape = literal_eval(row["input"])
-        if first(conv_args, input_shape):
-            report_testcase(conv_args, input_shape)
-        if len(first) >= args.limit:
-            break
+    with convtuner.utils.timer("total"):
+        first = Once()
+        testcases = pd.read_csv(args.testcases).sort_values("gflops")
+        for _, row in testcases.iterrows():
+            conv_args = literal_eval(row["conv2d"])
+            input_shape = literal_eval(row["input"])
+            if first(conv_args, input_shape):
+                report_testcase(conv_args, input_shape)
+            if len(first) >= args.limit:
+                break
 
     stats["speedup_factor"] /= max(1, stats["speedup_count"])
 

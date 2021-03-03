@@ -1,10 +1,12 @@
 import ctypes
 import gc
 import logging
+import math
 import os
 import re
 import threading
 from _ctypes import dlclose
+from collections import defaultdict
 from functools import cmp_to_key, lru_cache, reduce
 from functools import partial
 from itertools import chain
@@ -24,6 +26,7 @@ VECTOR_BITS = VECTOR_SIZE * 32
 PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
 CXX = "gcc-10"
 OPT = 3
+THREETILE = False
 
 expand = sympy.expand
 simplify = partial(sympy.simplify, evaluate=True)
@@ -147,6 +150,35 @@ class LoopRange(Node):
         return (is_true(self.begin + VECTOR_SIZE <= self.end) and
                 expand(((self.end - self.begin) // self.step) % VECTOR_SIZE) == 0)
 
+    def tile(self, tiling):
+        width = expand(self.end - self.begin)
+        assert self.step == 1  # TODO(jansel): support this
+        assert width.is_integer  # TODO(jansel): support this
+        width = int(width)
+        var = str(self.name)
+
+        max_tiling = 1
+        while width > 0 and (width % (max_tiling * 2)) == 0:
+            max_tiling *= 2
+
+        if tiling >= width:
+            tiling = width
+        elif tiling > max_tiling:
+            tiling = max_tiling
+
+        t0 = f"{var}_t0"
+        t1 = f"{var}_t1"
+
+        assert width % tiling == 0
+        return (LoopRange(t0, width // tiling),
+                LoopRange(t1, tiling),
+                {var: expand(f"{t0} * {tiling} + {t1} + {self.begin}")})
+
+
+class IVDepLoopRange(LoopRange):
+    def __str__(self):
+        return "#pragma GCC ivdep\n" + super(IVDepLoopRange, self).__str__()
+
 
 class Loops(Node):
     def __str__(self):
@@ -174,6 +206,8 @@ class Loops(Node):
         return node_fn(Loops(new_ranges, body))
 
     def simplify_conditionals(self, first, last):
+        if any(is_false(r.begin < r.end) for r in self.ranges) or self.body is None:
+            return None
         first = dict(first)
         last = dict(last)
         for rng in self.ranges:
@@ -182,8 +216,8 @@ class Loops(Node):
         return Loops(self.ranges, self.body.simplify_conditionals(first, last))
 
     def cache_writes(self):
-        if tls.cfg.boolean("skip_cache_writes"):
-            return self, None
+        if tls.cfg.boolean(f"{tls.prefix}skip_cache_writes"):
+            return self, []
         body, stores = self.body.cache_writes()
         stores = set(stores)
         ranges = []
@@ -202,14 +236,14 @@ class Loops(Node):
                 return
             seen.append(store)
             var = tmpvar()
-            if isinstance(store, ReduceStore):
+            if isinstance(store, (ReduceStore, VectorStore)):
                 defs.append(TempDef(var).vectorize())
             else:
                 defs.append(TempDef(var))
             sums.append(Sum(store, [TempRef(var)], "v0"))
 
             def swap(n):
-                if isinstance(n, (Store, ReduceStore)) and matches(n):
+                if isinstance(n, (Store, ReduceStore, VectorStore)) and matches(n):
                     return TempRef(var)
                 return n
 
@@ -238,11 +272,11 @@ class Loops(Node):
             return Loops(ranges, body), []
 
     def vectorize_loops(self):
-        if tls.cfg.boolean("skip_vectorize"):
-            return self, None, None
+        if tls.cfg.boolean(f"{tls.prefix}skip_vectorize"):
+            return self, [], set()
         body, memory, banned = self.body.vectorize_loops()
         if any(m is False for m in memory):
-            return self, [False], banned
+            return Loops(self.ranges, body), [False], banned
         assert all(isinstance(x, str) for x in banned)
         assert all(isinstance(x, Memory) for x in memory)
         ranges = []
@@ -273,58 +307,80 @@ class Loops(Node):
                 first = False
             else:
                 ranges.append(rng)
+
+        result = Loops(reversed(ranges), body)
         if not first:
             memory = [False]  # stop
-        return Loops(reversed(ranges), body), memory, banned
+            # print(f"BEFORE\n{node}\nAFTER\n{result}")
+        return result, memory, banned
 
     def tiling_and_reorder(self):
-        ranges = {}
-        options0 = []
-        options1 = []
+        ranges = defaultdict(list)
         body = self.body
         for r in self.ranges:
             width = expand(r.end - r.begin)
-            assert r.begin == 0  # TODO(jansel): support this
             assert r.step == 1  # TODO(jansel): support this
             assert width.is_integer  # TODO(jansel): support this
             width = int(width)
             var = str(r.name)
-            options0.append(var)
 
+            lg_max_tiling = 0
             max_tiling = 1
-            while (width % (max_tiling * 2)) == 0:
+            while width > 0 and (width % (max_tiling * 2)) == 0:
                 max_tiling *= 2
+                lg_max_tiling += 1
+
+            tiling = tls.cfg.float(f"{tls.prefix}tiling_{var}", 0.0, 1.0)
+            if THREETILE:
+                tiling2 = tls.cfg.float(f"{tls.prefix}tiling2_{var}", 0.0, 1.0)
 
             if max_tiling > 1:
-                tiling = tls.cfg.power_of_two(f"tiling_{var}", 1, max_tiling)
-                options1.append(var)
                 t0 = f"{var}_t0"
                 t1 = f"{var}_t1"
-                ranges[var] = [LoopRange(t0, width // tiling),
-                               LoopRange(t1, tiling)]
-                body = body.subs({var: expand(f"{t0} * {tiling} + {t1}")})
+                tiling = int(round(lg_max_tiling * tiling))
+                tiling = 2 ** tiling
+                if THREETILE:
+                    t2 = f"{var}_t2"
+                    tiling2 = int(round((lg_max_tiling - tiling) * tiling2))
+                    tiling2 = 2 ** tiling2
+                    assert width % (tiling * tiling2) == 0
+                    ranges[var] = [LoopRange(t0, width // (tiling2 * tiling)),
+                                   LoopRange(t2, tiling2),
+                                   LoopRange(t1, tiling)]
+                    body = body.subs({var: expand(
+                        f"{t0} * {tiling2 * tiling} + {t2} * {tiling} + {t1} + {r.begin}")})
+                else:
+                    assert width % (tiling) == 0
+
+                    ranges[var] = [LoopRange(t0, width // tiling),
+                                   LoopRange(t1, tiling)]
+                    body = body.subs({var: expand(
+                        f"{t0} * {tiling} + {t1} + {r.begin}")})
             else:
                 ranges[var] = [r]
 
+        options = ["n", "g", "out_channel_g", "in_channel_g",
+                   "out0", "out1", "kernel0", "kernel1"] * (2 + int(THREETILE))
         loop_order = tls.cfg.permutation(
-            "loop_order", list(chain(reversed(options0),
-                                     reversed(options1))))
+            f"{tls.prefix}loop_order", list(reversed((options))))
+        assert len(loop_order) == len(options), f"{loop_order} != {options}"
 
         new_ranges = []
         for var in loop_order:
-            new_ranges.append(ranges[var].pop())
+            if ranges[var]:
+                new_ranges.append(ranges[var].pop())
 
         assert all(len(x) == 0 for x in ranges.values())
 
         return Loops(reversed(new_ranges), body)
 
     def split_loops(self, constants):
-        limit = tls.cfg.integer("split_loops_limit", 0, 4)  # exponential;
-        threshold = tls.cfg.integer("split_loops_threshold", 3, 32)
-        if limit <= 0:
+        limit = tls.cfg.integer(f"{tls.prefix}split_loops_limit", 0, 2)  # exponential;
+        threshold = tls.cfg.integer(f"{tls.prefix}split_loops_threshold", 1, 128)
+        conds = list(chain(*[c.tests for c in self.find_all(Condition)]))
+        if limit <= 0 or len(conds) == 0:
             return self
 
-        conds = list(chain(*[c.tests for c in self.find_all(Condition)]))
         assert not any(map(is_boolean, conds))
         ranges = []
         body = self.body
@@ -343,10 +399,10 @@ class Loops(Node):
                     idx = rng.begin + ((rng.end - rng.begin) // rng.step - offset) * rng.step
                     if (limit >= 1 and is_true(idx >= rng.begin) and
                             any(is_boolean(x.subs({rng.name: idx})) for x in conds)):
-                        splits.append(idx)
+                        if not splits or is_true(splits[0] < idx):
+                            splits.append(idx)
                         break
             if splits:
-                assert len(splits) == 1 or is_true(splits[0] < splits[1])
                 split_ranges = []
                 for split in splits:
                     split_ranges.append(LoopRange(
@@ -425,7 +481,7 @@ class Reduction(Node):
         return node_fn(self.__class__(output, inputs, expression))
 
     def cache_writes(self):
-        return self, self.find_all((Store, ReduceStore))
+        return self, self.find_all((Store, ReduceStore, VectorStore))
 
     def vectorize_loops(self):
         return self, self.find_all(Memory), set()
@@ -438,13 +494,19 @@ class Sum(Reduction):
             expr = re.sub(fr"\bv{i}\b", str(v), expr)
         if isinstance(self.output, ReduceStore):
             return f"{self.output} += _mm{VECTOR_BITS}_reduce_add_ps({expr});"
+        if isinstance(self.output, VectorStore):
+            if str(self.expression) == "v0*v1":
+                return self.output.fma_cpp(*self.inputs)
+            else:
+                assert str(self.expression) == "v0"
+                return self.output.add_cpp(*self.inputs)
         return f"{self.output} += {expr};"
 
 
 class Block(Node):
     def __init__(self, statements):
         super(Block, self).__init__()
-        self.statements = statements
+        self.statements = [x for x in statements if x is not None]
 
     def apply(self, node_fn, expr_fn):
         stmts = []
@@ -472,8 +534,10 @@ class Block(Node):
         stores = []
         for s in self.statements:
             a, b = s.cache_writes()
-            statements.append(a)
-            stores.extend(b)
+            if a is not None:
+                statements.append(a)
+            if b is not None:
+                stores.extend(b)
         return Block(statements), stores
 
     def vectorize_loops(self):
@@ -529,11 +593,19 @@ class VectorizedMemory(Memory):
 
 
 class VectorLoad(VectorizedMemory):
-    pass
+    def __str__(self):
+        # TODO(jansel): generate aligned loads
+        return f"_mm256_loadu_ps({self.name} + {self.index})"
 
 
 class VectorStore(VectorizedMemory):
-    pass
+    def fma_cpp(self, a, b):
+        # TODO(jansel): generate aligned loads
+        return f"fma_storeu({self.name} + {self.index}, {a}, {b});"
+
+    def add_cpp(self, a):
+        # TODO(jansel): generate aligned loads
+        return f"add_storeu({self.name} + {self.index}, {a});"
 
 
 class ReduceStore(Memory):
@@ -580,7 +652,7 @@ class TempDef(Node):
 def funcdef(body):
     return f"""
         #include "{PREFIX_HEADER}"
-        extern "C" void convolution(
+        void convolution(
             float* __restrict__ image,
             float* __restrict__ weight,
             float* __restrict__ out
@@ -591,54 +663,132 @@ def funcdef(body):
         """
 
 
-def codegen_and_compile(cfg, constants, output_filename):
-    tls.cfg = cfg
-    tmpvar.count = 0
+def tile_and_reorder(cfg, n, g, out_chan, in_chan, out0, out1, kernel0, kernel1):
+    replacements = {}
 
+    names = ["n", "g", "out0", "out1", "out_chan", "in_chan", "kernel0", "kernel"]
+    values = [n, g, out0, out1, out_chan, in_chan, kernel0, kernel1]
+
+    order = cfg.permutation("loop_order", names)
+    values = [values[names.index(k)] for k in order]
+    return Loops(values, convolution_body().subs(replacements))
+
+
+def make_convolution(constants, cfg):
+    c = constants
+    begin0 = int(math.ceil(c["padding0"] / c["stride0"]))
+    begin1 = int(math.ceil(c["padding1"] / c["stride1"]))
+    end0 = int(math.ceil((c["in_sizes0"] - c["kernel_size0"] + 1 + c["padding0"]) / c["stride0"]))
+    end1 = int(math.ceil((c["in_sizes1"] - c["kernel_size1"] + 1 + c["padding1"]) / c["stride1"]))
+    assert end0 <= c["out_sizes0"]
+    assert end1 <= c["out_sizes1"]
+    regions = [
+        convolution_loopranges(out_begin0=0, out_end0=begin0,
+                               out_begin1=0, out_end1=begin1),
+        convolution_loopranges(out_begin0=0, out_end0=begin0,
+                               out_begin1=begin1, out_end1=end1),
+        convolution_loopranges(out_begin0=0, out_end0=begin0,
+                               out_begin1=end1, out_end1=c["out_sizes1"]),
+        convolution_loopranges(out_begin0=begin0, out_end0=end0,
+                               out_begin1=0, out_end1=begin1),
+        convolution_loopranges(out_begin0=begin0, out_end0=end0,
+                               out_begin1=begin1, out_end1=end1),
+        convolution_loopranges(out_begin0=begin0, out_end0=end0,
+                               out_begin1=end1, out_end1=c["out_sizes1"]),
+        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
+                               out_begin1=0, out_end1=begin1),
+        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
+                               out_begin1=begin1, out_end1=end1),
+        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
+                               out_begin1=end1, out_end1=c["out_sizes1"]),
+    ]
+
+    regions = [
+        tile_and_reorder(cfg, *[l.subs(constants) for l in loops])
+        for loops in regions
+    ]
+
+    lifted_loops = []
+    while len(set(str(x.ranges[0]) for x in regions)) == 1:
+        lifted_loops.append(regions[0].ranges[0])
+        for loops in regions:
+            loops.ranges.pop(0)
+
+    code = Block(regions)
+    if lifted_loops:
+        code = Loops(lifted_loops, code)
+    return code.subs(constants)
+
+
+def convolution_loopranges(out_begin0=0, out_end0="out_sizes0",
+                           out_begin1=0, out_end1="out_sizes1"):
+    return [LoopRange("n", "batch_size"),
+            LoopRange("g", "groups"),
+            LoopRange("out_channel_g", "out_channels // groups"),
+            LoopRange("in_channel_g", "in_channels // groups"),
+            LoopRange("out0", out_begin0, out_end0),
+            LoopRange("out1", out_begin1, out_end1),
+            LoopRange("kernel0", "kernel_size0"),
+            LoopRange("kernel1", "kernel_size1")]
+
+
+def convolution_body():
+    # This defines the convolution algorithm
     macros = {"in_channel": expand("in_channel_g + g * (in_channels // groups)"),
               "out_channel": expand("out_channel_g + g * (out_channels // groups)"),
               "in0": expand("out0 * stride0 + kernel0 * dilation0 - padding0"),
               "in1": expand("out1 * stride1 + kernel1 * dilation1 - padding1"), }
+    return Condition(["0 <= in0",
+                      "0 <= in1",
+                      "in0 < in_sizes0",
+                      "in1 < in_sizes1"],
+                     Sum(
+                         Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
+                         [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
+                          Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
+                         "v0 * v1")).subs(macros)
 
-    # This defines the convolution algorithm
-    body = Loops(
-        [LoopRange("n", "batch_size"),
-         LoopRange("g", "groups"),
-         LoopRange("out_channel_g", "out_channels // groups"),
-         LoopRange("in_channel_g", "in_channels // groups"),
-         LoopRange("out0", "out_sizes0"),
-         LoopRange("out1", "out_sizes1"),
-         LoopRange("kernel0", "kernel_size0"),
-         LoopRange("kernel1", "kernel_size1")],
-        Condition(
-            ["0 <= in0",
-             "0 <= in1",
-             "in0 < in_sizes0",
-             "in1 < in_sizes1"],
-            Sum(
-                Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
-                [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
-                 Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
-                "v0 * v1"))).subs(macros).subs(constants)
 
-    # Some ad-hoc compiler passes
-    with timer("simplify"):
-        body = body.simplify_conditionals(dict(), dict())
-    with timer("tiling_and_reorder"):
-        body = body.tiling_and_reorder()
-    with timer("split_loops"):
-        body = body.split_loops(constants)
-    with timer("simplify"):
-        body = body.simplify_conditionals(dict(), dict()).simplify()
-    with timer("vectorize"):
-        body, _, _ = body.vectorize_loops()
-    with timer("cache_writes"):
-        body, _ = body.cache_writes()
+def ivdep(node):
+    if isinstance(node, Loops):
+        memory = node.find_all((Store, VectorStore, ReduceStore))
+        ranges = []
+        for rng in reversed(node.ranges):
+            if all(is_true(sympy.diff(s.index, rng.name) > 0) for s in memory):
+                ranges.append(IVDepLoopRange(rng.name, rng.begin, rng.end, rng.step))
+            else:
+                ranges.append(rng)
+        return Loops(reversed(ranges), node.body)
+    return node
 
-    print_code(body)
 
-    with NamedTemporaryFile(suffix=".cpp") as source:
-        source.write(funcdef(body).encode("utf-8"))
+def codegen_and_compile(cfg, constants, output_filename):
+    tls.prefix = ""
+    tls.cfg = cfg
+    tmpvar.count = 0
+    c = constants
+    assert c["dilation0"] == 1 and c["dilation1"] == 1
+
+    passes = [
+        # ("tiling_and_reorder", lambda body: body.tiling_and_reorder()),
+        # ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
+        # ("split_loops", lambda body: body.split_loops(constants)),
+        ("simplify", lambda body: body.simplify_conditionals(dict(), dict()).simplify()),
+        # ("print", lambda body: print_code(body) or body),
+        ("vectorize", lambda body: body.vectorize_loops()[0]),
+        ("ivdep", lambda body: body.apply_node(ivdep)),
+        ("cache_writes", lambda body: body.cache_writes()[0]),
+    ]
+
+    code = make_convolution(constants, cfg)
+    for pass_name, pass_fn in passes:
+        with timer(pass_name):
+            code = pass_fn(code)
+
+    print_code(code)
+
+    with NamedTemporaryFile(suffix=".c") as source:
+        source.write(funcdef(code).encode("utf-8"))
         source.flush()
         cmd = [
             CXX, "-shared", "-o", output_filename, source.name,
