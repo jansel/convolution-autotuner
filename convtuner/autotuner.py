@@ -29,7 +29,7 @@ parser.add_argument("--input")
 parser.set_defaults(**vars(parser.parse_args([
     "--no-dups",
     # "--stop-after=600",
-    f"--parallelism={multiprocessing.cpu_count() * 2}",
+    f"--parallelism={multiprocessing.cpu_count()}",
     "--parallel-compile",
     "--technique=convtuner",
     "--conv2d", "(576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros')",

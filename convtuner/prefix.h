@@ -1,4 +1,5 @@
 #include <immintrin.h>
+#include <string.h>
 
 /*
 static inline int Max(int a, int b) {

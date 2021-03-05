@@ -1,5 +1,8 @@
 from opentuner import ConfigurationManipulator, PermutationParameter, IntegerParameter
-from opentuner.search.manipulator import PowerOfTwoParameter, BooleanParameter, FloatParameter
+from opentuner.search.manipulator import BooleanParameter
+from opentuner.search.manipulator import FloatParameter
+from opentuner.search.manipulator import PowerOfTwoParameter
+from opentuner.search.manipulator import EnumParameter
 
 from .utils import Once
 
@@ -35,6 +38,11 @@ class ConfigRecorder(object):
             self.manipulator.add_parameter(BooleanParameter(name))
         return False
 
+    def enum(self, name, items):
+        if self.first(name):
+            self.manipulator.add_parameter(EnumParameter(name, items))
+        return items[0]
+
 
 class ConfigProxy(object):
     def __init__(self, config: dict):
@@ -49,6 +57,7 @@ class ConfigProxy(object):
     integer = get
     boolean = get
     float = get
+    enum = get
 
 
 class DummyConfig(object):
@@ -66,3 +75,6 @@ class DummyConfig(object):
 
     def float(self, name, min_value, max_value):
         return min_value
+
+    def enum(self, name, items):
+        return items[0]

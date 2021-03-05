@@ -24,8 +24,6 @@ VERBOSE = False
 VECTOR_SIZE = 8
 VECTOR_BITS = VECTOR_SIZE * 32
 PREFIX_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefix.h")
-CXX = "gcc-10"
-OPT = 3
 THREETILE = False
 
 expand = sympy.expand
@@ -141,10 +139,10 @@ class LoopRange(Node):
         self.step = expand(step)
 
     def apply(self, node_fn, expr_fn):
-        return node_fn(LoopRange(name=self.name,
-                                 begin=expr_fn(self.begin),
-                                 end=expr_fn(self.end),
-                                 step=expr_fn(self.step)))
+        return node_fn(self.__class__(name=self.name,
+                                      begin=expr_fn(self.begin),
+                                      end=expr_fn(self.end),
+                                      step=expr_fn(self.step)))
 
     def can_vectorize(self):
         return (is_true(self.begin + VECTOR_SIZE <= self.end) and
@@ -203,7 +201,9 @@ class Loops(Node):
                 body = body.subs({r.name: r.begin})
             else:
                 new_ranges.append(r)
-        return node_fn(Loops(new_ranges, body))
+        if len(self.ranges) == 0:
+            return node_fn(body)
+        return node_fn(self.__class__(new_ranges, body))
 
     def simplify_conditionals(self, first, last):
         if any(is_false(r.begin < r.end) for r in self.ranges) or self.body is None:
@@ -215,9 +215,20 @@ class Loops(Node):
             last[rng.name] = expand((rng.end - 1).subs(last))
         return Loops(self.ranges, self.body.simplify_conditionals(first, last))
 
+    def insert_prefix_suffix(self, depth, prefix, suffix):
+        upper_ranges = self.ranges[:depth]
+        lower_ranges = self.ranges[depth:]
+        assert upper_ranges and lower_ranges
+        return Loops(lower_ranges, Block([
+            prefix,
+            Loops(upper_ranges, self.body),
+            suffix
+        ]))
+
     def cache_writes(self):
         if tls.cfg.boolean(f"{tls.prefix}skip_cache_writes"):
             return self, []
+
         body, stores = self.body.cache_writes()
         stores = set(stores)
         ranges = []
@@ -439,7 +450,7 @@ class Condition(Node):
             return body
         if any(map(is_false, tests)):
             return None
-        return node_fn(Condition(tests, body))
+        return node_fn(self.__class__(tests, body))
 
     def simplify_conditionals(self, first_sub, last_sub):
         tests = []
@@ -467,9 +478,9 @@ class Condition(Node):
         return Condition(self.tests, body), memory, banned
 
 
-class Reduction(Node):
-    def __init__(self, output, inputs, expression):
-        super(Reduction, self).__init__()
+class Statement(Node):
+    def __init__(self, output, inputs, expression="v0"):
+        super(Statement, self).__init__()
         self.output: Memory = output
         self.inputs: List[Memory] = list(inputs)
         self.expression: sympy.Expr = expand(expression)
@@ -487,6 +498,10 @@ class Reduction(Node):
         return self, self.find_all(Memory), set()
 
 
+class Reduction(Statement):
+    pass
+
+
 class Sum(Reduction):
     def __str__(self):
         expr = str(self.expression)
@@ -501,6 +516,16 @@ class Sum(Reduction):
                 assert str(self.expression) == "v0"
                 return self.output.add_cpp(*self.inputs)
         return f"{self.output} += {expr};"
+
+
+class Assign(Reduction):
+    def __str__(self):
+        expr = str(self.expression)
+        for i, v in enumerate(self.inputs):
+            expr = re.sub(fr"\bv{i}\b", str(v), expr)
+        if expr == "0" and isinstance(self.output, VectorizedMemory):
+            expr = "_mm256_setzero_ps()"
+        return f"{self.output} = {expr};"
 
 
 class Block(Node):
@@ -520,7 +545,7 @@ class Block(Node):
             return None
         if len(stmts) == 1:
             return stmts[0]
-        return node_fn(Block(stmts))
+        return node_fn(self.__class__(stmts))
 
     def __str__(self):
         return "{\n" + "\n".join(map(str, self.statements)) + "}\n"
@@ -551,6 +576,25 @@ class Block(Node):
             banned.update(c)
         return Block(statements), memory, banned
 
+    def fuse_loops(self, limit):
+        if not all(isinstance(s, Loops) for s in self.statements):
+            return self
+
+        lifted = []
+        not_lifted = [list(s.ranges) for s in self.statements]
+        bodies = [s.body for s in self.statements]
+
+        while len(lifted) < limit and all(not_lifted) and len(set(str(l[0]) for l in not_lifted)) == 1:
+            # all loops the same
+            lifted.append(not_lifted[0][0])
+            for r in not_lifted:
+                r.pop(0)
+
+        code = Block([Loops(r, b) for r, b in zip(not_lifted, bodies)])
+        if lifted:
+            code = Loops(lifted, code)
+        return code
+
 
 class Memory(Node):
     @classmethod
@@ -569,6 +613,24 @@ class Memory(Node):
 
     def apply(self, node_fn, expr_fn):
         return node_fn(self.__class__(self.name, expr_fn(self.index)))
+
+
+class Literal(Node):
+    def __init__(self, value):
+        super(Literal, self).__init__()
+        self.value = value
+
+    def __str__(self):
+        return self.value
+
+    def apply(self, node_fn, expr_fn):
+        return node_fn(self.__class__(self.value))
+
+    def vectorize_loops(self):
+        return self, [], set()
+
+    def cache_writes(self):
+        return self, []
 
 
 class Load(Memory):
@@ -649,32 +711,37 @@ class TempDef(Node):
                               f"_mm{VECTOR_BITS}_setzero_ps()")
 
 
-def funcdef(body):
+def funcdef(body, constants):
     return f"""
         #include "{PREFIX_HEADER}"
         void convolution(
-            float* __restrict__ image,
-            float* __restrict__ weight,
+            const float* __restrict__ image,
+            /* const float* __restrict__ weight, */
+            /* const float* __restrict__ bias, */
             float* __restrict__ out
         )
         {{
+            const float* __restrict__ weight = (float* __restrict__) 0x{constants["weight_data_ptr"]:x}L;
+            const float* __restrict__ bias = (float* __restrict__) 0x{constants.get("bias_data_ptr", 0):x}L;
             {body}
         }}
         """
 
 
-def tile_and_reorder(cfg, n, g, out_chan, in_chan, out0, out1, kernel0, kernel1):
-    replacements = {}
+def reorder_loops(cfg, constants, loops):
+    loops = [l.subs(constants) for l in loops]
+    order = cfg.permutation("loop_order",
+                            ["n", "g",
+                             "out0", "out1",
+                             "out_channel_g", "in_channel_g",
+                             "kernel0", "kernel1"])
+    name_to_idx = {k: i for i, k in enumerate(loop.name for loop in loops)}
+    order = [k for k in order if k in name_to_idx]
+    assert len(order) == len(name_to_idx), f"len({order}) != len({name_to_idx})"
+    return [loops[name_to_idx[k]] for k in order]
 
-    names = ["n", "g", "out0", "out1", "out_chan", "in_chan", "kernel0", "kernel"]
-    values = [n, g, out0, out1, out_chan, in_chan, kernel0, kernel1]
 
-    order = cfg.permutation("loop_order", names)
-    values = [values[names.index(k)] for k in order]
-    return Loops(values, convolution_body().subs(replacements))
-
-
-def make_convolution(constants, cfg):
+def nine_way_split(fn, constants):
     c = constants
     begin0 = int(math.ceil(c["padding0"] / c["stride0"]))
     begin1 = int(math.ceil(c["padding1"] / c["stride1"]))
@@ -682,41 +749,50 @@ def make_convolution(constants, cfg):
     end1 = int(math.ceil((c["in_sizes1"] - c["kernel_size1"] + 1 + c["padding1"]) / c["stride1"]))
     assert end0 <= c["out_sizes0"]
     assert end1 <= c["out_sizes1"]
-    regions = [
-        convolution_loopranges(out_begin0=0, out_end0=begin0,
-                               out_begin1=0, out_end1=begin1),
-        convolution_loopranges(out_begin0=0, out_end0=begin0,
-                               out_begin1=begin1, out_end1=end1),
-        convolution_loopranges(out_begin0=0, out_end0=begin0,
-                               out_begin1=end1, out_end1=c["out_sizes1"]),
-        convolution_loopranges(out_begin0=begin0, out_end0=end0,
-                               out_begin1=0, out_end1=begin1),
-        convolution_loopranges(out_begin0=begin0, out_end0=end0,
-                               out_begin1=begin1, out_end1=end1),
-        convolution_loopranges(out_begin0=begin0, out_end0=end0,
-                               out_begin1=end1, out_end1=c["out_sizes1"]),
-        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
-                               out_begin1=0, out_end1=begin1),
-        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
-                               out_begin1=begin1, out_end1=end1),
-        convolution_loopranges(out_begin0=end0, out_end0=c["out_sizes0"],
-                               out_begin1=end1, out_end1=c["out_sizes1"]),
+    return [
+        fn(out_begin0=0, out_end0=begin0,
+           out_begin1=0, out_end1=begin1),
+        fn(out_begin0=0, out_end0=begin0,
+           out_begin1=begin1, out_end1=end1),
+        fn(out_begin0=0, out_end0=begin0,
+           out_begin1=end1, out_end1=c["out_sizes1"]),
+        fn(out_begin0=begin0, out_end0=end0,
+           out_begin1=0, out_end1=begin1),
+        fn(out_begin0=begin0, out_end0=end0,
+           out_begin1=begin1, out_end1=end1),
+        fn(out_begin0=begin0, out_end0=end0,
+           out_begin1=end1, out_end1=c["out_sizes1"]),
+        fn(out_begin0=end0, out_end0=c["out_sizes0"],
+           out_begin1=0, out_end1=begin1),
+        fn(out_begin0=end0, out_end0=c["out_sizes0"],
+           out_begin1=begin1, out_end1=end1),
+        fn(out_begin0=end0, out_end0=c["out_sizes0"],
+           out_begin1=end1, out_end1=c["out_sizes1"]),
     ]
 
+
+def make_convolution(constants, cfg):
+    fuse_limit = cfg.integer("fuse_limit", 0, 5)
+    use_memset = not constants["bias"] and cfg.boolean("use_memset")
+
     regions = [
-        tile_and_reorder(cfg, *[l.subs(constants) for l in loops])
-        for loops in regions
+        Loops(reorder_loops(cfg, constants, loops), convolution_body())
+        for loops in nine_way_split(convolution_loopranges, constants)
     ]
 
-    lifted_loops = []
-    while len(set(str(x.ranges[0]) for x in regions)) == 1:
-        lifted_loops.append(regions[0].ranges[0])
-        for loops in regions:
-            loops.ranges.pop(0)
+    if not use_memset:
+        prefixes = [
+            Loops(reorder_loops(cfg, constants, loops), bias_body(constants))
+            for loops in nine_way_split(pointwise_loopranges, constants)
+        ]
+        regions = [Block([p, r]).fuse_loops(fuse_limit)
+                   for p, r in zip(prefixes, regions)]
 
-    code = Block(regions)
-    if lifted_loops:
-        code = Loops(lifted_loops, code)
+    code = Block(regions).fuse_loops(fuse_limit)
+
+    if use_memset:
+        size = expand("sizeof(float) * batch_size * out_channels * out_sizes0 * out_sizes1").subs(constants)
+        code = Block([Literal(f"memset(out, 0, {size});"), code])
     return code.subs(constants)
 
 
@@ -732,21 +808,41 @@ def convolution_loopranges(out_begin0=0, out_end0="out_sizes0",
             LoopRange("kernel1", "kernel_size1")]
 
 
+def pointwise_loopranges(out_begin0=0, out_end0="out_sizes0",
+                         out_begin1=0, out_end1="out_sizes1"):
+    return [LoopRange("n", "batch_size"),
+            LoopRange("g", "groups"),
+            LoopRange("out_channel_g", "out_channels // groups"),
+            LoopRange("out0", out_begin0, out_end0),
+            LoopRange("out1", out_begin1, out_end1)]
+
+
 def convolution_body():
-    # This defines the convolution algorithm
     macros = {"in_channel": expand("in_channel_g + g * (in_channels // groups)"),
               "out_channel": expand("out_channel_g + g * (out_channels // groups)"),
               "in0": expand("out0 * stride0 + kernel0 * dilation0 - padding0"),
               "in1": expand("out1 * stride1 + kernel1 * dilation1 - padding1"), }
-    return Condition(["0 <= in0",
-                      "0 <= in1",
-                      "in0 < in_sizes0",
-                      "in1 < in_sizes1"],
+    return Condition(["0 <= in0", "in0 < in_sizes0",
+                      "0 <= in1", "in1 < in_sizes1"],
                      Sum(
                          Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
                          [Load.from_indices("weight", ["out_channel", "in_channel_g", "kernel0", "kernel1"]),
                           Load.from_indices("image", ["n", "in_channel", "in0", "in1"])],
                          "v0 * v1")).subs(macros)
+
+
+def bias_body(constants):
+    macros = {"out_channel": expand("out_channel_g + g * (out_channels // groups)")}
+    if constants["bias"]:
+        return Assign(
+            Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
+            [Load.from_indices("bias", ["out_channel"])]
+        ).subs(macros)
+    else:
+        return Assign(
+            Store.from_indices("out", ["n", "out_channel", "out0", "out1"]),
+            [Literal("0")]
+        ).subs(macros)
 
 
 def ivdep(node):
@@ -762,22 +858,89 @@ def ivdep(node):
     return node
 
 
+def gcc_flags(cfg):
+    # This is a pretty small subset of the flags from:
+    # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.htm
+    # TODO(jansel): expand list of tuned flags
+    flags = [
+        "-funroll-loops",
+        # "-fsplit-loops",
+        # "-fpeel-loops",
+        # "-funswitch-loops",
+        # "-fgcse-after-reload",
+        # "-fipa-cp-clone",
+        # "-floop-interchange",
+        # "-floop-unroll-and-jam",
+        # "-fpeel-loops",
+        # "-fpredictive-commoning",
+        # "-fsplit-loops",
+        # "-fsplit-paths",
+        # "-ftree-loop-distribution",
+        # "-ftree-loop-vectorize",
+        # "-ftree-partial-pre",
+        # "-ftree-slp-vectorize",
+        # "-funswitch-loops",
+        # "-fversion-loops-for-strides",
+        # "-fgcse-sm",
+        # "-fgcse-las",
+    ]
+
+    def convert(flag):
+        option = cfg.enum("gcc-" + flag[2:], ["default", "on", "off"])
+        if option == "on":
+            return flag
+        if option == "off":
+            return f"-fno-{flag[2:]}"
+
+    flags = list(map(convert, flags))
+    flags.append(cfg.enum("gcc-sched-stalled-insns", [
+        "",
+        "-fsched-stalled-insns=0",
+        "-fsched-stalled-insns=1",
+        # "-fsched-stalled-insns=32",
+    ]))
+    flags.append(cfg.enum("gcc-sched-stalled-insns-dep", [
+        "",
+        "-fsched-stalled-insns-dep=0",
+        "-fsched-stalled-insns-dep=1",
+        # "-fsched-stalled-insns-dep=32",
+    ]))
+    # flags.append(cfg.enum("gcc-vect-cost-model", [
+    #     "",
+    #     "-fvect-cost-model=unlimited",
+    #     "-fvect-cost-model=dynamic",
+    #     "-fvect-cost-model=cheap"]))
+
+    unroll = cfg.integer("unroll_insns", 1, 4096)
+    flags.extend([
+        f"--param=max-average-unrolled-insns={unroll}",
+        f"--param=max-unroll-times={unroll}",
+        f"--param=max-unrolled-insns={unroll}",
+    ])
+    flags.append("-fallow-store-data-races")
+    return [x for x in flags if x]
+
+
 def codegen_and_compile(cfg, constants, output_filename):
     tls.prefix = ""
     tls.cfg = cfg
     tmpvar.count = 0
     c = constants
+    # TODO(jansel): debug/support dilation
     assert c["dilation0"] == 1 and c["dilation1"] == 1
+    # cxx = cfg.enum("cxx", ["clang-11", "gcc-10"])
+    cxx = cfg.enum("cxx", ["gcc-10"])
+    opt = cfg.enum("opt_level", ["3", "2", "fast"])
 
     passes = [
         # ("tiling_and_reorder", lambda body: body.tiling_and_reorder()),
         # ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
         # ("split_loops", lambda body: body.split_loops(constants)),
         ("simplify", lambda body: body.simplify_conditionals(dict(), dict()).simplify()),
-        # ("print", lambda body: print_code(body) or body),
-        ("vectorize", lambda body: body.vectorize_loops()[0]),
-        ("ivdep", lambda body: body.apply_node(ivdep)),
-        ("cache_writes", lambda body: body.cache_writes()[0]),
+        # ("vectorize", lambda body: body.vectorize_loops()[0]),
+        ("ivdep", lambda body: (body.apply_node(ivdep) if ("gcc" in cxx) else body)),
+        ("cache_writes", lambda body: body.cache_writes()[0].simplify()),
+        ("print", lambda body: print_code(body, constants) or body),
     ]
 
     code = make_convolution(constants, cfg)
@@ -785,24 +948,28 @@ def codegen_and_compile(cfg, constants, output_filename):
         with timer(pass_name):
             code = pass_fn(code)
 
-    print_code(code)
-
     with NamedTemporaryFile(suffix=".c") as source:
-        source.write(funcdef(code).encode("utf-8"))
+        source.write(funcdef(code, constants).encode("utf-8"))
         source.flush()
         cmd = [
-            CXX, "-shared", "-o", output_filename, source.name,
-            f"-O{OPT}", "-ffast-math", "-march=native",
-            "-Wall", "-Werror"
+            cxx, "-shared", "-o", output_filename, source.name,
+            f"-O{opt}", "-ffast-math", "-march=native",
+            "-Wall", "-Wno-unused-variable",
         ]
+        if "gcc" in cxx:
+            cmd.extend(gcc_flags(cfg))
+        else:
+            assert "clang" in cxx
+            cmd.extend(["-fPIC"])
+
         log.debug(" ".join(cmd))
         with timer("compile"):
             check_call(cmd)
     tls.cfg = None
 
 
-def print_code(code):
-    VERBOSE and Popen("clang-format", stdin=PIPE).communicate(funcdef(code).encode("utf-8"))
+def print_code(code, constants):
+    VERBOSE and Popen("clang-format", stdin=PIPE).communicate(funcdef(code, constants).encode("utf-8"))
 
 
 class ConvolutionGenerator(object):
@@ -841,6 +1008,14 @@ class ConvolutionGenerator(object):
         weight_stride0, weight_stride1, weight_stride2, weight_stride3 = weight.stride()
         out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
 
+        if conv.bias is not None:
+            bias_stride0, = conv.bias.stride()
+            bias_data_ptr = conv.bias.data_ptr()
+            bias = 1
+        else:
+            bias = 0
+
+        weight_data_ptr = conv.weight.data_ptr()
         return {k: v for k, v in locals().items() if isinstance(v, int)}
 
     def __init__(self, cfg, conv, image, subproc=False):
@@ -852,8 +1027,8 @@ class ConvolutionGenerator(object):
                           constants["out_channels"],
                           constants["out_sizes0"],
                           constants["out_sizes1"])
-        if self.bias is not None:
-            self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
+        # if self.bias is not None:
+        #     self.bias = self.bias.view(1, self.bias.shape[0], 1, 1)
 
         with NamedTemporaryFile(suffix=".so") as shared_object:
             if subproc:
@@ -879,10 +1054,7 @@ class ConvolutionGenerator(object):
             gc.collect()
 
     def __call__(self, image):
-        out = torch.zeros(self.out_shape)
+        out = torch.empty(self.out_shape)
         self.compiled(ctypes.c_void_p(image.data_ptr()),
-                      ctypes.c_void_p(self.weight.data_ptr()),
                       ctypes.c_void_p(out.data_ptr()))
-        if self.bias is not None:
-            out += self.bias
         return out
