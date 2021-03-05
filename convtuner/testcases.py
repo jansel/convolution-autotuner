@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 import timeit
 from ast import literal_eval
@@ -59,7 +60,8 @@ def report_testcase(conv_args, input_shape):
     if args.dummy:
         cfg = DummyConfig()
     else:
-        if args.autotune:
+        filename = f"./configs/{repr(conv_args)},{repr(input_shape)}.json"
+        if args.autotune or not os.path.exists(filename):
             retry(lambda: check_call([
                 sys.executable,
                 sys.argv[0],
@@ -68,7 +70,7 @@ def report_testcase(conv_args, input_shape):
                 "--input", repr(input_shape),
                 f"--test-limit={args.test_limit}",
             ]))
-        cfg = ConfigProxy(json.load(open(f"./configs/{repr(conv_args)},{repr(input_shape)}.json")))
+        cfg = ConfigProxy(json.load(open(filename)))
     pytorch, autotuned, speedup = measure_testcase(
         cfg, torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
     print(f"{pytorch:.1f} gflops => {autotuned:.1f} gflops ({speedup:.2f}x)")
@@ -90,7 +92,7 @@ def main(argv=None):
     parser.add_argument('--case', type=int)
     parser.add_argument('--autotune', action="store_true")
     parser.add_argument('--dummy', action="store_true")
-    parser.add_argument('--limit', '-l', default=9999, type=int)
+    parser.add_argument('--limit', '-l', default=50, type=int)
     parser.add_argument('--test-limit', default=500, type=int)
     parser.add_argument('--testcases', default="testcases.csv")
     args = parser.parse_args(argv)

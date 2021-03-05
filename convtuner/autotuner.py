@@ -4,6 +4,7 @@ import json
 import logging
 import multiprocessing
 import os
+import random
 import timeit
 
 import opentuner
@@ -12,12 +13,17 @@ from numpy import median
 from opentuner import Result
 from opentuner.measurement import MeasurementInterface
 from opentuner.search.bandittechniques import AUCBanditMetaTechnique
-from opentuner.search.evolutionarytechniques import NormalGreedyMutation, UniformGreedyMutation
-from opentuner.search.manipulator import ConfigurationManipulator, NumericParameter, BooleanParameter, \
-    PermutationParameter
+from opentuner.search.differentialevolution import DifferentialEvolution
+from opentuner.search.evolutionarytechniques import NormalGreedyMutation
+from opentuner.search.manipulator import BooleanParameter
+from opentuner.search.manipulator import ConfigurationManipulator
+from opentuner.search.manipulator import EnumParameter
+from opentuner.search.manipulator import NumericParameter
+from opentuner.search.manipulator import PermutationParameter
 
 from convtuner.codegen import ConvolutionGenerator
-from convtuner.config_recorder import ConfigProxy, ConfigRecorder
+from convtuner.config_recorder import ConfigProxy
+from convtuner.config_recorder import ConfigRecorder
 from convtuner.utils import gflops
 
 log = logging.getLogger(__name__)
@@ -29,6 +35,7 @@ parser.add_argument("--input")
 parser.set_defaults(**vars(parser.parse_args([
     "--no-dups",
     # "--stop-after=600",
+    "--test-limit=1000",
     f"--parallelism={multiprocessing.cpu_count()}",
     "--parallel-compile",
     "--technique=convtuner",
@@ -36,12 +43,18 @@ parser.set_defaults(**vars(parser.parse_args([
     "--input", "(1, 576, 1, 1)",
 ])))
 
+# opentuner.search.technique.register(AUCBanditMetaTechnique([
+#     # TODO(jansel): test more advanced search techniques
+#     NormalGreedyMutation(name="Normal5", mutation_rate=0.05),
+#     NormalGreedyMutation(name="Normal10", mutation_rate=0.10),
+#     NormalGreedyMutation(name="Normal15", mutation_rate=0.15),
+#     UniformGreedyMutation(name="Uniform50", mutation_rate=0.50),
+# ], name="convtuner"))
+
 opentuner.search.technique.register(AUCBanditMetaTechnique([
-    # TODO(jansel): test more advanced search techniques
     NormalGreedyMutation(name="Normal5", mutation_rate=0.05),
     NormalGreedyMutation(name="Normal10", mutation_rate=0.10),
-    NormalGreedyMutation(name="Normal15", mutation_rate=0.15),
-    UniformGreedyMutation(name="Uniform50", mutation_rate=0.50),
+    DifferentialEvolution(population_size=10, cr=0.8, information_sharing=1),
 ], name="convtuner"))
 
 
@@ -76,11 +89,27 @@ class ConvTuner(MeasurementInterface):
                 return False
             if isinstance(p, PermutationParameter):
                 return list(p._items)
+            if isinstance(p, EnumParameter):
+                return p.options[0]
             assert False
 
-        return [
-            # {p.name: min_value(p) for p in node.manipulator().params}
-        ]
+        def default_config():
+            return {p.name: min_value(p) for p in self.manipulator().params}
+
+        seeds = [default_config()]
+        for name in os.listdir("configs"):
+            config = default_config()
+            seed = json.load(open(os.path.join("configs", name)))
+            seed = {k: v for k, v in seed.items() if k in config}
+            if set(seed.keys()) == set(config.keys()):
+                seeds.append(seed)
+            else:  # New config values we need to initialize
+                config2 = self.manipulator().random()
+                config.update(seed)
+                config2.update(seed)
+                seeds.extend([config, config2])
+        random.shuffle(seeds)
+        return seeds[:100]
 
     def compile_and_run(self, desired_result, input, limit):
         return Result(time=self.measure_cfg(desired_result.configuration.data))
@@ -109,7 +138,7 @@ class ConvTuner(MeasurementInterface):
         gf = gflops(self.conv, self.image) * self.times / sec
         print(f"Final configuration ({sec:.2f}s, {gf:.1f} gflops): {self.config_filename()}")
         with open(self.config_filename(), "w") as fd:
-            json.dump(cfg, fd, indent=2)
+            json.dump(cfg, fd, indent=2, sort_keys=True)
             fd.write("\n")
 
     def config_filename(self):

@@ -1,0 +1,28 @@
+{
+  "batch_first": true,
+  "cxx": "gcc-10",
+  "fuse_limit": 2,
+  "loop_order": [
+    "g",
+    "kernel0",
+    "out0",
+    "n",
+    "out_channel_g",
+    "in_channel_g",
+    "out1",
+    "kernel1"
+  ],
+  "opt_level": "fast",
+  "prefetch": false,
+  "prefetch_count": 3,
+  "prefetch_latency": 418,
+  "prefetch_ratio": 16,
+  "skip_cache_writes": true,
+  "stalled": false,
+  "stalled_insns": 6,
+  "tile_size": 226,
+  "tiling": true,
+  "unroll": true,
+  "unroll_insns": 130,
+  "use_memset": false
+}
