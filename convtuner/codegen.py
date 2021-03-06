@@ -263,9 +263,9 @@ def codegen_and_compile(cfg, constants, output_filename):
 
     passes = [
         # ("tiling_and_reorder", lambda body: body.tiling_and_reorder()),
-        # ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
+        ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
         # ("split_loops", lambda body: body.split_loops(constants)),
-        ("simplify", lambda body: body.simplify()),
+        # ("simplify", lambda body: body.simplify()),
         # ("vectorize", lambda body: body.vectorize_loops()[0]),
         ("ivdep", lambda body: (body.apply_node(ivdep) if ("gcc" in cxx) else body)),
         ("cache_writes", lambda body: body.cache_writes()[0].simplify()),
