@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 
 def make_convolution(constants, cfg):
-    fuse_limit = cfg.integer("fuse_limit", 0, 5)
+    fuse_limit = cfg.integer("fuse_limit", 0, 10)
     use_memset = cfg.boolean("use_memset") and not constants["bias"]
 
     regions = [
@@ -145,13 +145,39 @@ def reorder_loops(cfg, constants, loops):
                              "out0", "out1",
                              "out_channel_g", "in_channel_g",
                              "kernel0", "kernel1"])
-    if cfg.boolean("batch_first"):
+    batch_first = cfg.boolean("batch_first")
+    if batch_first:
         # bias towards n coming first
         order = ["n"] + [x for x in order if x != "n"]
+
     name_to_idx = {k: i for i, k in enumerate(loop.name for loop in loops)}
     order = [k for k in order if k in name_to_idx]
     assert len(order) == len(name_to_idx), f"len({order}) != len({name_to_idx})"
-    return [loops[name_to_idx[k]] for k in order]
+    loops = [loops[name_to_idx[k]] for k in order]
+
+    outer = []
+    inner = []
+    for loop in loops:
+        assert loop.step == 1
+        tiling = cfg.power_of_two(f"tiling_{loop.name}", 1, 128)
+        uneven = cfg.boolean(f"tiling_{loop.name}_uneven")
+        width = int(expand(loop.end - loop.begin))
+        var = loop.name + "_tile"
+        if loop.name == "n" and batch_first:
+            tiling = 1
+
+        if tiling >= width:
+            inner.append(loop)
+        elif tiling > 1 and width % tiling == 0:
+            outer.append(LoopRange(var, loop.begin, loop.end, tiling))
+            inner.append(LoopRange(loop.name, var, expand(f"{var} + {tiling}")))
+        elif tiling >= 8 and uneven:
+            outer.append(LoopRange(var, loop.begin, loop.end, tiling))
+            inner.append(LoopRange(loop.name, var, expand(f"Min({var} + {tiling}, {loop.end})")))
+        else:
+            outer.append(loop)
+
+    return outer + inner
 
 
 def nine_way_split(fn, constants):
@@ -189,7 +215,7 @@ def ivdep(node):
         memory = node.find_all((Store, VectorStore, ReduceStore))
         ranges = []
         for rng in reversed(node.ranges):
-            if all(is_true(sympy.diff(s.index, rng.name) > 0) for s in memory):
+            if all(is_true(sympy.diff(s.index, str(rng.name).replace("_tile", "")) > 0) for s in memory):
                 ranges.append(IVDepLoopRange(rng.name, rng.begin, rng.end, rng.step))
             else:
                 ranges.append(rng)
@@ -203,12 +229,7 @@ def gcc_flags(cfg):
     # TODO(jansel): expand list of tuned flags
 
     flags = []
-
-    # flags.append(cfg.enum("gcc-vect-cost-model", [
-    #     "",
-    #     "-fvect-cost-model=unlimited",
-    #     "-fvect-cost-model=dynamic",
-    #     "-fvect-cost-model=cheap"]))
+    return flags
 
     prefetch_ratio = cfg.integer('prefetch_ratio', 1, 20)
     prefetch_latency = cfg.integer('prefetch_latency', 32, 512)
@@ -249,7 +270,7 @@ def gcc_flags(cfg):
     return [x for x in flags if x]
 
 
-def codegen_and_compile(cfg, constants, output_filename):
+def codegen_and_compile(cfg, constants, output_filename, standalone_times=None):
     ir.tls.prefix = ""
     ir.tls.cfg = cfg
     tmpvar.count = 0
@@ -263,9 +284,8 @@ def codegen_and_compile(cfg, constants, output_filename):
 
     passes = [
         # ("tiling_and_reorder", lambda body: body.tiling_and_reorder()),
-        ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
         # ("split_loops", lambda body: body.split_loops(constants)),
-        # ("simplify", lambda body: body.simplify()),
+        ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
         # ("vectorize", lambda body: body.vectorize_loops()[0]),
         ("ivdep", lambda body: (body.apply_node(ivdep) if ("gcc" in cxx) else body)),
         ("cache_writes", lambda body: body.cache_writes()[0].simplify()),
@@ -281,10 +301,21 @@ def codegen_and_compile(cfg, constants, output_filename):
         source.write(funcdef(code, constants).encode("utf-8"))
         source.flush()
         cmd = [
-            cxx, "-shared", "-o", output_filename, source.name,
-            f"-O{opt}", "-ffast-math", "-march=native",
-            # "-Wall", "-Wno-unused-variable",
+            cxx, "-o", output_filename, source.name,
+            f"-O{opt}", "-march=native",
         ]
+        if standalone_times:
+            cmd.extend(f"-D{k}={v}" for k, v in [
+                ("IMAGE_LEN", c["image_numel"]),
+                ("WEIGHT_LEN", c["weight_numel"]),
+                ("BIAS_LEN", c["bias_numel"]),
+                ("OUT_LEN", c["out_numel"]),
+                ("STANDALONE", 1),
+                ("TIMES", standalone_times),
+            ])
+        else:
+            cmd.append("-shared")
+
         if "gcc" in cxx:
             cmd.extend(gcc_flags(cfg))
         else:
@@ -338,17 +369,23 @@ class ConvolutionGenerator(object):
         weight_stride0, weight_stride1, weight_stride2, weight_stride3 = weight.stride()
         out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
 
+        image_numel = image.numel()
+        weight_numel = weight.numel()
+        out_numel = out.numel()
+
         if conv.bias is not None:
             bias_stride0, = conv.bias.stride()
             bias_data_ptr = conv.bias.data_ptr()
             bias = 1
+            bias_numel = conv.bias.numel()
         else:
+            bias_numel = 1
             bias = 0
 
         weight_data_ptr = conv.weight.data_ptr()
         return {k: v for k, v in locals().items() if isinstance(v, int)}
 
-    def __init__(self, cfg, conv, image, subproc=False):
+    def __init__(self, cfg, conv, image, standalone_filename=None, standalone_times=None):
         super(ConvolutionGenerator, self).__init__()
         constants = self.get_constants(conv, image)
         if PERMUTE_WEIGHTS:
@@ -376,20 +413,26 @@ class ConvolutionGenerator(object):
                           constants["out_sizes0"],
                           constants["out_sizes1"])
 
-        with NamedTemporaryFile(suffix=".so") as shared_object:
-            if subproc:
-                p = Process(target=codegen_and_compile, args=(cfg, constants, shared_object.name))
-                try:
-                    p.start()
-                    p.join()
-                except:
-                    p.kill()
-                    raise
-            else:
+        if standalone_filename:
+            assert standalone_times
+            self.standalone_codegen_and_compile(cfg, constants, standalone_filename, standalone_times)
+            self.compiled = None
+        else:
+            with NamedTemporaryFile(suffix=".so") as shared_object:
                 codegen_and_compile(cfg, constants, shared_object.name)
-            lib = ctypes.cdll.LoadLibrary(shared_object.name)
-            self.compiled = lib.convolution
-            self.handle = lib._handle
+                lib = ctypes.cdll.LoadLibrary(shared_object.name)
+                self.compiled = lib.convolution
+                self.handle = lib._handle
+
+    def standalone_codegen_and_compile(self, cfg, constants, standalone_filename, standalone_times):
+        p = Process(target=codegen_and_compile, args=(cfg, constants, standalone_filename, standalone_times))
+        try:
+            p.start()
+            p.join()
+            assert p.exitcode == 0
+        except:
+            p.kill()
+            raise
 
     def close(self):
         if self.compiled is not None:

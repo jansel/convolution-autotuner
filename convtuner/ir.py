@@ -114,6 +114,11 @@ class LoopRange(Node):
     def __str__(self):
         return f"for(int {self.name} = {self.begin}; {self.name} < {self.end}; {self.name} += {self.step})"
 
+    def __repr__(self):
+        return f"""{self.__class__.__name__}({','.join(map('"{}"'.format, [
+            self.name, self.begin, self.end, self.step
+        ]))})"""
+
     def __init__(self, name, begin, end=None, step=1):
         super(LoopRange, self).__init__()
         self.name = name

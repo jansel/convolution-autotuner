@@ -38,6 +38,8 @@ CASES = [
      (32, 120, 28, 28)),  # 7
     ((128, 128, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
      (32, 128, 28, 28)),  # 8
+    ((16, 16, (3, 3), (2, 2), (1, 1), (1, 1), 16, False, 'zeros'),
+    (1, 16, 112, 112)),  # 9
 ]
 log = logging.getLogger(__name__)
 stats = Counter()
@@ -64,14 +66,14 @@ def report_testcase(conv_args, input_shape):
     else:
         filename = f"./configs/{repr(conv_args)},{repr(input_shape)}.json"
         if args.autotune or not os.path.exists(filename):
-            retry(lambda: check_call([
+            check_call([
                 sys.executable,
                 sys.argv[0],
                 "autotune",
                 "--conv2d", repr(conv_args),
                 "--input", repr(input_shape),
                 f"--test-limit={args.test_limit}",
-            ]))
+            ])
         cfg = ConfigProxy(json.load(open(filename)))
     pytorch, autotuned, speedup = measure_testcase(
         cfg, torch.nn.Conv2d(*conv_args), torch.randn(input_shape))
