@@ -1,19 +1,22 @@
 {
-  "batch_first": true,
+  "batch_first": false,
   "cxx": "gcc-10",
-  "fuse_limit": 5,
+  "edge_unroll_threshold": 8,
+  "fuse_limit": 7,
+  "fuse_mode": "partial",
   "loop_order": [
+    "n",
     "g",
     "out0",
     "out1",
     "out_channel_g",
-    "kernel1",
-    "n",
     "in_channel_g",
-    "kernel0"
+    "kernel0",
+    "kernel1"
   ],
   "opt_level": "fast",
-  "skip_cache_writes": false,
+  "skip_edge_unroll": false,
+  "skip_nine_way_split": false,
   "tiling_g": 1,
   "tiling_g_uneven": false,
   "tiling_in_channel_g": 1,
@@ -29,6 +32,5 @@
   "tiling_out1": 1,
   "tiling_out1_uneven": false,
   "tiling_out_channel_g": 1,
-  "tiling_out_channel_g_uneven": false,
-  "use_memset": true
+  "tiling_out_channel_g_uneven": false
 }

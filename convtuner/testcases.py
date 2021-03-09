@@ -17,30 +17,8 @@ from numpy import median
 import convtuner.utils
 from convtuner import codegen
 from convtuner.config_recorder import ConfigProxy, DummyConfig
-from convtuner.utils import gflops, Once, retry
+from convtuner.utils import gflops, Once
 
-CASES = [
-    ((576, 1280, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-     (1, 576, 1, 1)),  # 0
-    ((16, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, True, 'zeros'),
-     (32, 16, 55, 55)),  # 1
-    ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 512, 28, 28)),  # 2
-    ((128, 128, (3, 3), (1, 1), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 128, 56, 56)),  # 3
-    ((120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
-     (32, 120, 28, 28)),  # 4
-    ((64, 64, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
-     (32, 64, 56, 56)),  # 5
-    ((512, 512, (3, 3), (2, 2), (1, 1), (1, 1), 32, False, 'zeros'),
-     (32, 512, 28, 28)),  # 6
-    ((120, 120, (5, 5), (1, 1), (2, 2), (1, 1), 120, False, 'zeros'),
-     (32, 120, 28, 28)),  # 7
-    ((128, 128, (1, 1), (1, 1), (0, 0), (1, 1), 1, False, 'zeros'),
-     (32, 128, 28, 28)),  # 8
-    ((16, 16, (3, 3), (2, 2), (1, 1), (1, 1), 16, False, 'zeros'),
-    (1, 16, 112, 112)),  # 9
-]
 log = logging.getLogger(__name__)
 stats = Counter()
 results = []
@@ -92,30 +70,27 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='count', default=0)
     parser.add_argument('--times', type=int, default=3)
-    parser.add_argument('--repeat', type=int, default=3)
+    parser.add_argument('--repeat', type=int, default=5)
     parser.add_argument('--case', type=int)
     parser.add_argument('--autotune', action="store_true")
     parser.add_argument('--dummy', action="store_true")
     parser.add_argument('--limit', '-l', default=50, type=int)
     parser.add_argument('--test-limit', default=500, type=int)
-    parser.add_argument('--testcases', default="testcases.csv")
+    parser.add_argument('--testcases-filename', default="testcases.csv")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     codegen.VERBOSE = args.verbose
 
-    if args.case is not None:
-        report_testcase(*CASES[args.case])
-        return
-
     with convtuner.utils.timer("total"):
         first = Once()
-        testcases = pd.read_csv(args.testcases).sort_values("gflops")
+        testcases = pd.read_csv(args.testcases_filename).sort_values("gflops")
         for _, row in testcases.iterrows():
             conv_args = literal_eval(row["conv2d"])
             input_shape = literal_eval(row["input"])
-            if first(conv_args, input_shape):
+            if first(conv_args, input_shape) and (args.case is None or args.case == len(first)):
+                sys.stdout.write(f"{len(first)}: ")
                 report_testcase(conv_args, input_shape)
-            if len(first) >= args.limit:
+            if len(first) >= args.limit and args.case is None:
                 break
 
     stats["speedup_factor"] /= max(1, stats["speedup_count"])

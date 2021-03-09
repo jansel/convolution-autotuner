@@ -32,8 +32,8 @@ def gflops(conv, image):
                       in_channels // groups] +
                      out_sizes +
                      kernel_size)
-    # if conv.bias is not None:
-    #    gflops += product([batch_size, out_channels] + out_sizes)
+    if conv.bias is None:
+        gflops -= product([batch_size, out_channels] + out_sizes)
     return gflops / 1000000000.0
 
 

@@ -14,7 +14,7 @@ from numpy import median
 from opentuner import Result
 from opentuner.measurement import MeasurementInterface
 from opentuner.search.bandittechniques import AUCBanditMetaTechnique
-from opentuner.search.evolutionarytechniques import NormalGreedyMutation
+from opentuner.search.evolutionarytechniques import NormalGreedyMutation, UniformGreedyMutation
 from opentuner.search.manipulator import BooleanParameter
 from opentuner.search.manipulator import ConfigurationManipulator
 from opentuner.search.manipulator import EnumParameter
@@ -56,6 +56,7 @@ opentuner.search.technique.register(AUCBanditMetaTechnique([
     NormalGreedyMutation(name="Normal4", mutation_rate=0.04),
     NormalGreedyMutation(name="Normal8", mutation_rate=0.08),
     NormalGreedyMutation(name="Normal16", mutation_rate=0.16),
+    UniformGreedyMutation(name="Uniform32", mutation_rate=0.32)
 ], name="convtuner"))
 
 
@@ -86,24 +87,27 @@ class ConvTuner(MeasurementInterface):
         return {p.name: min_value(p) for p in self.manipulator().params}
 
     def seed_configurations(self):
+        count = 50
         first = Once()
-        seeds = [self.default_config()]
+        mine = []
+        others = []
         for name in os.listdir("configs"):
-            config = self.default_config()
-            data = open(os.path.join("configs", name)).read()
-            seed = json.loads(data)
-            seed = {k: v for k, v in seed.items() if k in config}
+            if not name.endswith('.json'):
+                continue
+            config = self.manipulator().random()
+            filename = os.path.join("configs", name)
+            data = open(filename).read()
             if not first(data):
-                pass
-            elif set(seed.keys()) == set(config.keys()):
-                seeds.append(seed)
-            else:  # New config values we need to initialize
-                config2 = self.manipulator().random()
-                config.update(seed)
-                config2.update(seed)
-                seeds.extend([config, config2])
-        random.shuffle(seeds)
-        return seeds[:50]
+                continue
+            config.update({k: v
+                           for k, v in json.loads(data).items()
+                           if isinstance(v, type(config.get(k)))})
+            if os.path.exists(self.config_filename()) and os.path.samefile(filename, self.config_filename()):
+                mine.append(config)
+            else:
+                others.append(config)
+        random.shuffle(others)
+        return (mine + others)[:count]
 
     def compile_and_run(self, desired_result, input, limit):
         return Result(time=self.measure_cfg(desired_result.configuration.data))

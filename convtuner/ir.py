@@ -1,7 +1,7 @@
 import logging
 import re
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial, cmp_to_key, lru_cache, reduce
 from itertools import chain
 from typing import List
@@ -128,6 +128,10 @@ class LoopRange(Node):
         self.end = expand(end)
         self.step = expand(step)
 
+    @property
+    def width(self):
+        return int(expand((self.end - self.begin) // self.step))
+
     def apply(self, node_fn, expr_fn):
         return node_fn(self.__class__(name=self.name,
                                       begin=expr_fn(self.begin),
@@ -198,12 +202,33 @@ class Loops(Node):
     def simplify_conditionals(self, first, last):
         if any(is_false(r.begin < r.end) for r in self.ranges) or self.body is None:
             return None
+        ranges = list(self.ranges)
+        body = self.body
+
+        if isinstance(body, Condition):
+            for test in body.tests:
+                if len(test.free_symbols) == 1:
+                    var = str(list(test.free_symbols)[0])
+                    for i in range(len(ranges)):
+                        if ranges[i].name == var and ranges[i].step == 1:
+                            # Narrow this loop range to remove the conditional
+                            begin = ranges[i].begin
+                            end = ranges[i].end
+                            step = ranges[i].step
+                            if is_false(test.subs({var: begin})) and is_false(test.subs({var: end - step})):
+                                break  # unreachable code
+                            while is_false(test.subs({var: begin})) and is_true(begin < end):
+                                begin = begin + step
+                            while is_false(test.subs({var: end - step})) and is_true(begin < end):
+                                end = end - step
+                            ranges[i] = LoopRange(var, begin, end, step)
+
         first = dict(first)
         last = dict(last)
-        for rng in self.ranges:
+        for rng in ranges:
             first[rng.name] = expand(rng.begin.subs(first))
             last[rng.name] = expand((rng.end - 1).subs(last))
-        return Loops(self.ranges, self.body.simplify_conditionals(first, last))
+        return Loops(ranges, body.simplify_conditionals(first, last))
 
     def insert_prefix_suffix(self, depth, prefix, suffix):
         upper_ranges = self.ranges[:depth]
@@ -236,11 +261,13 @@ class Loops(Node):
             if any(map(matches, seen)):
                 return
             seen.append(store)
+
             var = tmpvar()
             if isinstance(store, (ReduceStore, VectorStore)):
                 defs.append(TempDef(var).vectorize())
             else:
                 defs.append(TempDef(var))
+
             sums.append(Sum(store, [TempRef(var)], "v0"))
 
             def swap(n):
@@ -421,10 +448,47 @@ class Loops(Node):
             ranges.insert(0, rng)
         return Loops(ranges, body)
 
+    def unroll(self, limit):
+        ranges = list(self.ranges)
+        body = [self.body]
+        while ranges and ranges[-1].width * len(body) <= limit:
+            new_body = []
+            rng = ranges.pop()
+            for i in range(rng.width):
+                new_body.extend([
+                    b.subs({rng.name: rng.begin + rng.step * i})
+                    for b in body])
+            body = new_body
+        return Loops(ranges, Block(body))
+
+    def fuse_pointwise_prefix(self, pointwise: "Loops"):
+        input_ranges = deque(self.ranges)
+        output_ranges = []
+
+        conditions = []
+        for rng1 in pointwise.ranges:
+            rng2 = input_ranges.popleft()
+            while str(rng1) != str(rng2):
+                conditions.append(sympy.Eq(sympy.Symbol(rng2.name), rng2.begin))
+                output_ranges.append(rng2)
+                rng2 = input_ranges.popleft()
+            output_ranges.append(rng2)
+
+        return Loops(output_ranges,
+                     Block([
+                         Condition(conditions, pointwise.body),
+                         Loops(list(input_ranges), self.body)
+                     ]))
+
 
 class Condition(Node):
     def __str__(self):
-        test = " && ".join(map(str, self.tests))
+        def _str(s):
+            if isinstance(s, sympy.Eq):
+                return f"{s.lhs} == {s.rhs}"
+            return str(s)
+
+        test = " && ".join(map(_str, self.tests))
         return f"if({test})\n{self.body}"
 
     def __init__(self, tests, body):
@@ -584,6 +648,9 @@ class Block(Node):
         if lifted:
             code = Loops(lifted, code)
         return code
+
+    def unroll(self, limit):
+        return Block([x.unroll(limit) for x in self.statements])
 
 
 class Memory(Node):

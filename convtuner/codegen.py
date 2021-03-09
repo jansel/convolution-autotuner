@@ -1,5 +1,6 @@
 import ctypes
 import gc
+import itertools
 import logging
 import math
 import os
@@ -39,26 +40,35 @@ log = logging.getLogger(__name__)
 
 def make_convolution(constants, cfg):
     fuse_limit = cfg.integer("fuse_limit", 0, 10)
-    use_memset = cfg.boolean("use_memset") and not constants["bias"]
+    fuse_mode = cfg.enum("fuse_mode", ["none", "partial", "full"])
 
     regions = [
         Loops(reorder_loops(cfg, constants, loops), convolution_body())
-        for loops in nine_way_split(convolution_loopranges, constants)
+        for loops in nine_way_split(cfg, convolution_loopranges, constants)
     ]
 
-    if not use_memset:
-        prefixes = [
-            Loops(reorder_loops(cfg, constants, loops), bias_body(constants))
-            for loops in nine_way_split(pointwise_loopranges, constants)
-        ]
+    prefixes = [
+        Loops(reorder_loops(cfg, constants, loops), bias_body(constants))
+        for loops in nine_way_split(cfg, pointwise_loopranges, constants)
+    ]
+
+    if fuse_mode == "full":
+        regions = [r.fuse_pointwise_prefix(p)
+                   for p, r in zip(prefixes, regions)]
+    elif fuse_mode == "partial":
         regions = [Block([p, r]).fuse_loops(fuse_limit)
                    for p, r in zip(prefixes, regions)]
+    else:
+        assert fuse_mode == "none"
 
     code = Block(regions).fuse_loops(fuse_limit)
 
-    if use_memset:
-        size = expand("sizeof(float) * batch_size * out_channels * out_sizes0 * out_sizes1").subs(constants)
-        code = Block([Literal(f"memset(out, 0, {size});"), code])
+    if fuse_mode == "none":
+        if constants["bias"]:
+            code = Block([Loops(pointwise_loopranges(), bias_body(constants)), code])
+        else:
+            size = expand("sizeof(float) * batch_size * out_channels * out_sizes0 * out_sizes1").subs(constants)
+            code = Block([Literal(f"memset(out, 0, {size});"), code])
     return code.subs(constants)
 
 
@@ -180,7 +190,9 @@ def reorder_loops(cfg, constants, loops):
     return outer + inner
 
 
-def nine_way_split(fn, constants):
+def nine_way_split(cfg, fn, constants):
+    if cfg.boolean("skip_nine_way_split"):
+        return [fn()]
     c = constants
     begin0 = int(math.ceil(c["padding0"] / c["stride0"]))
     begin1 = int(math.ceil(c["padding1"] / c["stride1"]))
@@ -188,26 +200,54 @@ def nine_way_split(fn, constants):
     end1 = int(math.ceil((c["in_sizes1"] - c["kernel_size1"] + 1 + c["padding1"]) / c["stride1"]))
     assert end0 <= c["out_sizes0"]
     assert end1 <= c["out_sizes1"]
-    return [
-        fn(out_begin0=0, out_end0=begin0,
-           out_begin1=0, out_end1=begin1),
-        fn(out_begin0=0, out_end0=begin0,
-           out_begin1=begin1, out_end1=end1),
-        fn(out_begin0=0, out_end0=begin0,
-           out_begin1=end1, out_end1=c["out_sizes1"]),
-        fn(out_begin0=begin0, out_end0=end0,
-           out_begin1=0, out_end1=begin1),
-        fn(out_begin0=begin0, out_end0=end0,
-           out_begin1=begin1, out_end1=end1),
-        fn(out_begin0=begin0, out_end0=end0,
-           out_begin1=end1, out_end1=c["out_sizes1"]),
-        fn(out_begin0=end0, out_end0=c["out_sizes0"],
-           out_begin1=0, out_end1=begin1),
-        fn(out_begin0=end0, out_end0=c["out_sizes0"],
-           out_begin1=begin1, out_end1=end1),
-        fn(out_begin0=end0, out_end0=c["out_sizes0"],
-           out_begin1=end1, out_end1=c["out_sizes1"]),
-    ]
+    result = []
+    for bounds in [
+        (0, begin0, 0, begin1),
+        (0, begin0, begin1, end1),
+        (0, begin0, end1, c["out_sizes1"]),
+        (begin0, end0, 0, begin1),
+        (begin0, end0, begin1, end1),
+        (begin0, end0, end1, c["out_sizes1"]),
+        (end0, c["out_sizes0"], 0, begin1),
+        (end0, c["out_sizes0"], begin1, end1),
+        (end0, c["out_sizes0"], end1, c["out_sizes1"]),
+    ]:
+        result.extend(edge_unroll(cfg, fn, constants, *bounds))
+    return result
+
+
+def edge_unroll(cfg, fn, constants, begin0, end0, begin1, end1):
+    len0 = end0 - begin0
+    len1 = end1 - begin1
+
+    threshold = cfg.integer("edge_unroll_threshold", 1, 10)
+    unroll0 = not cfg.boolean("skip_edge_unroll")
+    unroll1 = not cfg.boolean("skip_edge_unroll")
+
+    unroll0 = unroll0 and 1 < len0 <= threshold
+    unroll1 = unroll1 and 1 < len1 <= threshold
+
+    if unroll0 and unroll1 and len0 * len1 > threshold:
+        # Corner is too big
+        unroll0 = False
+        unroll1 = False
+
+    if unroll0 and unroll1:
+        return [fn(out_begin0=i0, out_end0=i0 + 1,
+                   out_begin1=i1, out_end1=i1 + 1)
+                for i0, i1 in itertools.product(range(begin0, end0),
+                                                range(begin1, end1))]
+    elif unroll0:
+        return [fn(out_begin0=i0, out_end0=i0 + 1,
+                   out_begin1=begin1, out_end1=end1)
+                for i0 in range(begin0, end0)]
+    elif unroll1:
+        return [fn(out_begin0=begin0, out_end0=end0,
+                   out_begin1=i1, out_end1=i1 + 1)
+                for i1 in range(begin1, end1)]
+    else:
+        return [fn(out_begin0=begin0, out_end0=end0,
+                   out_begin1=begin1, out_end1=end1)]
 
 
 def ivdep(node):
@@ -288,7 +328,7 @@ def codegen_and_compile(cfg, constants, output_filename, standalone_times=None):
         ("simplify", lambda body: body.simplify_conditionals(dict(), dict())),
         # ("vectorize", lambda body: body.vectorize_loops()[0]),
         ("ivdep", lambda body: (body.apply_node(ivdep) if ("gcc" in cxx) else body)),
-        ("cache_writes", lambda body: body.cache_writes()[0].simplify()),
+        # ("cache_writes", lambda body: body.cache_writes()[0].simplify()),
         ("print", lambda body: print_code(body, constants) or body),
     ]
 
